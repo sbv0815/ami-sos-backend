@@ -724,6 +724,31 @@ Reglas: violencia→llamar_155=true+nivel 3, salud grave→llamar_123=true+nivel
             return {'success': True, 'clasificacion': json.loads(match.group())}
         raise HTTPException(500, "Error parseando respuesta IA")
 
+# ==================== LOGIN ====================
+
+@app.get("/usuario/login/{celular}")
+async def login_usuario(celular: str):
+    """Verificar si un usuario existe y retornar sus datos."""
+    pool = await get_pool()
+    cs, cc = normalizar_celular(celular)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, nombre, apellido, celular, ciudad, country_code, bloqueado FROM usuarios_sos WHERE celular IN ($1,$2)",
+            cs, cc)
+        if not row:
+            raise HTTPException(404, "User not found")
+        if row['bloqueado']:
+            raise HTTPException(403, "User blocked")
+        return {
+            'success': True,
+            'id': row['id'],
+            'nombre': row['nombre'],
+            'apellido': row['apellido'],
+            'celular': row['celular'],
+            'ciudad': row['ciudad'],
+            'country_code': row['country_code'],
+        }
+
 # ==================== REGISTRO ====================
 
 @app.post("/usuario/registrar")
