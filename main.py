@@ -170,6 +170,22 @@ class ReporteUsuario(BaseModel):
     motivo: str = "comportamiento"      # comportamiento, acoso, falsa_identidad, spam, otro
     descripcion: Optional[str] = None
 
+class VigilanciaRequest(BaseModel):
+    celular: str
+    nombre: Optional[str] = None
+    descripcion: str                    # Qué vio sospechoso
+    latitud: float
+    longitud: float
+    tipo_sospecha: str = "general"      # vehiculo, persona, paquete, ruido, otro
+
+class VigilanciaConfirmar(BaseModel):
+    vigilancia_id: int
+    celular: str
+    confirma: bool = True               # True = "yo también lo veo", False = "no veo nada"
+    comentario: Optional[str] = None
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+
 # ==================== UTILIDADES ====================
 
 def normalizar_celular(celular: str) -> tuple:
@@ -812,6 +828,187 @@ async def obtener_respuestas(alerta_id: int):
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT nombre,entidad,celular,fecha_respuesta,tiempo_estimado_min,latitud,longitud,estado FROM respuestas_institucionales WHERE alerta_id=$1 ORDER BY fecha_respuesta", alerta_id)
     return {'success': True, 'respuestas': [row_to_dict(r) for r in rows], 'total': len(rows)}
+
+# ==================== VIGILANCIA PREVENTIVA ====================
+
+@app.post("/vigilancia")
+async def crear_vigilancia(req: VigilanciaRequest):
+    """
+    Ciudadano reporta algo sospechoso.
+    Se notifica a la red comunitaria en 1km.
+    Si 2+ confirman → se escala a policía automáticamente.
+    """
+    pool = await get_pool()
+    cs, cc = normalizar_celular(req.celular)
+    
+    async with pool.acquire() as conn:
+        # Crear registro de vigilancia
+        vid = await conn.fetchval("""
+            INSERT INTO vigilancias (celular, nombre, descripcion, tipo_sospecha, latitud, longitud)
+            VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+        """, cc, req.nombre, req.descripcion, req.tipo_sospecha, req.latitud, req.longitud)
+    
+    log.info(f"👁 Vigilancia #{vid}: {req.tipo_sospecha} por {cc} en ({req.latitud},{req.longitud})")
+    
+    # Notificar a la red comunitaria cercana
+    cercanos = await buscar_red_comunitaria(pool, req.latitud, req.longitud, cc)
+    notificados = 0
+    
+    for persona in cercanos:
+        try:
+            token_info = await buscar_token(pool, persona['celular'], persona['celular'])
+            if token_info and 'token' in token_info:
+                await enviar_push(
+                    token_info['token'],
+                    '👁 Suspicious activity nearby',
+                    f'{req.nombre or "Someone"}: {req.descripcion[:80]}',
+                    data={
+                        'tipo': 'vigilancia',
+                        'vigilancia_id': vid,
+                        'nombre': req.nombre or '',
+                        'descripcion': req.descripcion[:100],
+                        'tipo_sospecha': req.tipo_sospecha,
+                        'latitud': req.latitud,
+                        'longitud': req.longitud,
+                    }
+                )
+                notificados += 1
+        except Exception as e:
+            log.warning(f"  Push error: {e}")
+    
+    return {
+        'success': True,
+        'vigilancia_id': vid,
+        'notificados': notificados,
+        'cercanos_total': len(cercanos),
+        'mensaje': f'Watching #{vid} — {notificados} people notified nearby',
+    }
+
+@app.post("/vigilancia/confirmar")
+async def confirmar_vigilancia(req: VigilanciaConfirmar):
+    """
+    Vecino confirma o rechaza la sospecha.
+    Si 2+ confirman → se escala a policía automáticamente.
+    """
+    pool = await get_pool()
+    cs, cc = normalizar_celular(req.celular)
+    
+    async with pool.acquire() as conn:
+        # Verificar que la vigilancia existe y está activa
+        vig = await conn.fetchrow(
+            "SELECT * FROM vigilancias WHERE id=$1 AND estado='activa'", req.vigilancia_id)
+        if not vig:
+            raise HTTPException(404, "Vigilancia not found or closed")
+        
+        # Registrar confirmación (única por persona)
+        try:
+            await conn.execute("""
+                INSERT INTO confirmaciones_vigilancia (vigilancia_id, celular, confirma, comentario, latitud, longitud)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, req.vigilancia_id, cc, req.confirma, req.comentario, req.latitud, req.longitud)
+        except Exception:
+            raise HTTPException(409, "Already confirmed this watch")
+        
+        # Actualizar conteo
+        if req.confirma:
+            await conn.execute(
+                "UPDATE vigilancias SET confirmaciones = confirmaciones + 1 WHERE id=$1", req.vigilancia_id)
+        else:
+            await conn.execute(
+                "UPDATE vigilancias SET rechazos = rechazos + 1 WHERE id=$1", req.vigilancia_id)
+        
+        # Leer conteo actualizado
+        updated = await conn.fetchrow(
+            "SELECT confirmaciones, rechazos, escalada, celular, nombre, latitud, longitud, descripcion FROM vigilancias WHERE id=$1",
+            req.vigilancia_id)
+        
+        confirmaciones = updated['confirmaciones']
+        escalada = updated['escalada']
+        
+        # AUTO-ESCALAR si 2+ confirmaciones y no ha sido escalada
+        alerta_id = None
+        if confirmaciones >= 2 and not escalada:
+            # Crear alerta nivel 2 (involucra policía)
+            alerta_id = await conn.fetchval("""
+                INSERT INTO alertas_panico (celular, nombre, nivel_emergencia, tipo_alerta, mensaje, latitud, longitud, fuente_alerta)
+                VALUES ($1, $2, 2, 'sospecha_confirmada', $3, $4, $5, 'vigilancia_comunitaria') RETURNING id
+            """, updated['celular'], updated['nombre'],
+                f"Confirmed suspicious activity: {updated['descripcion'][:200]}. {confirmaciones} witnesses.",
+                updated['latitud'], updated['longitud'])
+            
+            # Marcar vigilancia como escalada
+            await conn.execute(
+                "UPDATE vigilancias SET escalada=TRUE, alerta_id=$1 WHERE id=$2",
+                alerta_id, req.vigilancia_id)
+            
+            log.warning(f"🚨 VIGILANCIA #{req.vigilancia_id} ESCALADA → Alerta #{alerta_id} ({confirmaciones} confirmaciones)")
+            
+            # Notificar a institucionales en 1km
+            # Usar la misma lógica de alerta nivel 2
+            from fastapi import BackgroundTasks
+            # La notificación a institucionales la hacemos inline
+            inst_rows = await conn.fetch("""
+                SELECT celular, nombre FROM ubicaciones_red
+                WHERE disponible = TRUE AND latitud IS NOT NULL
+                AND actualizado_at > NOW() - INTERVAL '30 minutes'
+            """)
+            for inst in inst_rows:
+                try:
+                    tk = await buscar_token(pool, inst['celular'], inst['celular'])
+                    if tk and 'token' in tk:
+                        await enviar_push(tk['token'],
+                            '🚨 Confirmed suspicious activity',
+                            f'{confirmaciones} people confirmed. Alert #{alerta_id}',
+                            data={'tipo': 'alerta', 'alerta_id': alerta_id, 'nivel_emergencia': 2,
+                                  'latitud': str(updated['latitud']), 'longitud': str(updated['longitud'])})
+                except: pass
+    
+    return {
+        'success': True,
+        'confirmaciones': confirmaciones,
+        'rechazos': updated['rechazos'],
+        'escalada': alerta_id is not None,
+        'alerta_id': alerta_id,
+        'mensaje': f'{"ESCALATED to police!" if alerta_id else "Confirmed"} ({confirmaciones}/2 needed)',
+    }
+
+@app.get("/vigilancia/{vigilancia_id}")
+async def obtener_vigilancia(vigilancia_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        vig = await conn.fetchrow("SELECT * FROM vigilancias WHERE id=$1", vigilancia_id)
+        if not vig: raise HTTPException(404, "Not found")
+        confs = await conn.fetch(
+            "SELECT celular, confirma, comentario, fecha FROM confirmaciones_vigilancia WHERE vigilancia_id=$1 ORDER BY fecha",
+            vigilancia_id)
+    return {
+        'success': True,
+        'vigilancia': row_to_dict(vig),
+        'confirmaciones': [row_to_dict(c) for c in confs],
+    }
+
+@app.get("/vigilancia/activas")
+async def vigilancias_activas(latitud: float, longitud: float):
+    """Ver vigilancias activas cerca de una ubicación."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, celular, nombre, descripcion, tipo_sospecha, latitud, longitud,
+                   confirmaciones, rechazos, escalada, fecha
+            FROM vigilancias
+            WHERE estado = 'activa' AND fecha > NOW() - INTERVAL '2 hours'
+        """)
+    
+    cercanas = []
+    for r in rows:
+        dist = distancia_km(latitud, longitud, float(r['latitud']), float(r['longitud']))
+        if dist <= 1.0:
+            v = row_to_dict(r)
+            v['distancia_km'] = round(dist, 2)
+            cercanas.append(v)
+    
+    cercanas.sort(key=lambda x: x['distancia_km'])
+    return {'success': True, 'vigilancias': cercanas, 'total': len(cercanas)}
 
 # ==================== REPORTAR USUARIO ====================
 
