@@ -164,6 +164,12 @@ class RelayBLE(BaseModel):
     tipo_alerta_ble: int = 3            # Tipo que transmite la manilla (1,2,3)
     rssi: Optional[int] = None          # Fuerza de señal BLE
 
+class ReporteUsuario(BaseModel):
+    celular_reporta: str                # Quien reporta
+    celular_reportado: str              # A quien reporta
+    motivo: str = "comportamiento"      # comportamiento, acoso, falsa_identidad, spam, otro
+    descripcion: Optional[str] = None
+
 # ==================== UTILIDADES ====================
 
 def normalizar_celular(celular: str) -> tuple:
@@ -269,16 +275,18 @@ async def buscar_token(pool, cel_sin: str, cel_con: str, id_persona: int = None)
 # ==================== BUSCAR RED COMUNITARIA 1KM ====================
 
 async def buscar_red_comunitaria(pool, lat: float, lon: float, excluir_celular: str) -> list:
-    """Busca usuarios de Ami SOS disponibles en radio 1km."""
+    """Busca usuarios de Ami SOS disponibles en radio 1km. Excluye bloqueados."""
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, celular, nombre, latitud, longitud
-            FROM ubicaciones_red
-            WHERE disponible = TRUE
-              AND latitud IS NOT NULL
-              AND longitud IS NOT NULL
-              AND actualizado_at > NOW() - INTERVAL '30 minutes'
-              AND celular != $1
+            SELECT ur.id, ur.celular, ur.nombre, ur.latitud, ur.longitud
+            FROM ubicaciones_red ur
+            LEFT JOIN usuarios_sos us ON us.celular = ur.celular
+            WHERE ur.disponible = TRUE
+              AND ur.latitud IS NOT NULL
+              AND ur.longitud IS NOT NULL
+              AND ur.actualizado_at > NOW() - INTERVAL '30 minutes'
+              AND ur.celular != $1
+              AND (us.bloqueado IS NULL OR us.bloqueado = FALSE)
         """, excluir_celular)
     
     cercanos = []
@@ -780,6 +788,76 @@ async def obtener_respuestas(alerta_id: int):
         rows = await conn.fetch("SELECT nombre,entidad,celular,fecha_respuesta,tiempo_estimado_min,latitud,longitud,estado FROM respuestas_institucionales WHERE alerta_id=$1 ORDER BY fecha_respuesta", alerta_id)
     return {'success': True, 'respuestas': [row_to_dict(r) for r in rows], 'total': len(rows)}
 
+# ==================== REPORTAR USUARIO ====================
+
+@app.post("/usuario/reportar")
+async def reportar_usuario(req: ReporteUsuario):
+    """
+    Reportar un usuario. Si acumula 3+ reportes, se bloquea automáticamente.
+    """
+    pool = await get_pool()
+    cs_reporta, cc_reporta = normalizar_celular(req.celular_reporta)
+    cs_reportado, cc_reportado = normalizar_celular(req.celular_reportado)
+    
+    async with pool.acquire() as conn:
+        # Verificar que no se reporte a sí mismo
+        if cc_reporta == cc_reportado:
+            raise HTTPException(400, "Cannot report yourself")
+        
+        # Verificar que no haya reportado antes
+        existe = await conn.fetchval(
+            "SELECT id FROM reportes_usuario WHERE celular_reportado=$1 AND celular_reporta=$2",
+            cc_reportado, cc_reporta)
+        if existe:
+            raise HTTPException(409, "Already reported this user")
+        
+        # Registrar reporte
+        await conn.execute("""
+            INSERT INTO reportes_usuario (celular_reportado, celular_reporta, motivo, descripcion)
+            VALUES ($1, $2, $3, $4)
+        """, cc_reportado, cc_reporta, req.motivo, req.descripcion)
+        
+        # Contar reportes totales
+        total_reportes = await conn.fetchval(
+            "SELECT COUNT(*) FROM reportes_usuario WHERE celular_reportado=$1",
+            cc_reportado)
+        
+        log.info(f"⚠️ Reporte: {cc_reporta} → {cc_reportado} ({req.motivo}). Total: {total_reportes}")
+        
+        # Auto-bloqueo si 3+ reportes
+        bloqueado = False
+        if total_reportes >= 3:
+            await conn.execute("""
+                UPDATE usuarios_sos SET bloqueado=TRUE, motivo_bloqueo=$1, fecha_bloqueo=NOW()
+                WHERE celular IN ($2, $3)
+            """, f"auto_block_{total_reportes}_reports", cs_reportado, cc_reportado)
+            
+            # También desactivar de la red
+            await conn.execute(
+                "UPDATE ubicaciones_red SET disponible=FALSE WHERE celular=$1", cc_reportado)
+            
+            bloqueado = True
+            log.warning(f"🚫 AUTO-BLOQUEO: {cc_reportado} con {total_reportes} reportes")
+    
+    return {
+        'success': True,
+        'total_reportes': total_reportes,
+        'usuario_bloqueado': bloqueado,
+        'mensaje': 'User blocked automatically' if bloqueado else 'Report registered',
+    }
+
+@app.get("/usuario/{celular}/reportes")
+async def ver_reportes(celular: str):
+    """Ver cuántos reportes tiene un usuario (solo conteo, no detalle)."""
+    pool = await get_pool()
+    cs, cc = normalizar_celular(celular)
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM reportes_usuario WHERE celular_reportado IN ($1,$2)", cs, cc)
+        bloqueado = await conn.fetchval(
+            "SELECT bloqueado FROM usuarios_sos WHERE celular IN ($1,$2)", cs, cc)
+    return {'success': True, 'total_reportes': total, 'bloqueado': bloqueado or False}
+
 # ==================== HEALTH ====================
 
 @app.get("/health")
@@ -788,14 +866,13 @@ async def health():
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        return {"status": "ok", "db": "postgresql", "version": "2.0.0", "timestamp": datetime.now().isoformat()}
+        return {"status": "ok", "db": "postgresql", "version": "3.0.0", "timestamp": datetime.now().isoformat()}
     except:
         return {"status": "degraded", "db": "disconnected"}
 
 @app.get("/")
 async def root():
-    return {"app": "🆘 Ami SOS", "version": "2.0.0", "niveles": {
-        1: "Leve → cuidadores",
-        2: "Grave → cuidadores + institucionales 1km",
-        3: "Crítica → cuidadores + institucionales + red comunitaria 1km"
-    }, "docs": "/docs"}
+    return {"app": "🆘 Ami SOS", "version": "3.0.0", "features": [
+        "3 alert levels", "community network", "BLE relay",
+        "auto-block after 3 reports", "multi-country support"
+    ], "docs": "/docs"}
