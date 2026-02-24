@@ -61,7 +61,7 @@ log = logging.getLogger("amisos")
 
 async def get_pool():
     if not hasattr(app.state, 'pool') or app.state.pool is None:
-        database_url = os.getenv('DATABASE_URL')
+        database_url = os.getenv('DATABASE_URL') or os.getenv('INTERNAL_DATABASE_URL')
         if database_url:
             app.state.pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
         else:

@@ -4,8 +4,15 @@ Ejecutar: python migrar_v4.py
 """
 
 import psycopg2
+import os
+import sys
 
-DATABASE_URL = "postgresql://fashion_tryon_db_user:NcP7js1f583j9D7XUtyODi5v2S6lZETO@dpg-d6cpof94tr6s73cbicbg-a.oregon-postgres.render.com/fashion_tryon_db?sslmode=require"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    print("❌ ERROR: Variable DATABASE_URL no está definida.")
+    print('En PowerShell: $env:DATABASE_URL = "postgresql://usuario:password@host/db?sslmode=require"')
+    sys.exit(1)
 
 def main():
     print("🆘 Ami SOS — Migración v4: Vigilancia Preventiva\n")
