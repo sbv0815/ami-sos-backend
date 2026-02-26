@@ -77,6 +77,14 @@ async def get_pool():
 
 @app.on_event("startup")
 async def startup():
+    # Configurar credenciales de Google Cloud desde variable de entorno
+    gcp_creds = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON', '')
+    if gcp_creds and not os.path.exists('/tmp/gcp-credentials.json'):
+        with open('/tmp/gcp-credentials.json', 'w') as f:
+            f.write(gcp_creds)
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/tmp/gcp-credentials.json'
+        log.info("✅ Credenciales Google Cloud configuradas")
+    
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
