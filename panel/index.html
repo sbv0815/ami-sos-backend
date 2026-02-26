@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ami SOS — Panel de Control</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg: #0a0f1c;
+            --surface: #111827;
+            --surface2: #1a2235;
+            --border: #1e293b;
+            --text: #e2e8f0;
+            --text-dim: #94a3b8;
+            --accent: #ef4444;
+            --accent-glow: rgba(239,68,68,0.15);
+            --green: #22c55e;
+            --amber: #f59e0b;
+            --blue: #3b82f6;
+            --purple: #8b5cf6;
+            --radius: 12px;
+            --font: 'DM Sans', sans-serif;
+            --mono: 'Space Mono', monospace;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100vh; }
+
+        /* === LOGIN === */
+        .login-screen {
+            display: flex; align-items: center; justify-content: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #0a0f1c 0%, #1a0a0a 100%);
+        }
+        .login-card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 16px; padding: 48px 40px; width: 400px;
+            box-shadow: 0 0 60px rgba(239,68,68,0.08);
+        }
+        .login-card h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+        .login-card .subtitle { color: var(--text-dim); margin-bottom: 32px; font-size: 14px; }
+        .login-card .sos-badge {
+            display: inline-block; background: var(--accent);
+            color: white; font-weight: 700; font-size: 11px;
+            padding: 3px 8px; border-radius: 4px; letter-spacing: 1px;
+            margin-left: 8px; vertical-align: middle;
+        }
+        .form-group { margin-bottom: 20px; }
+        .form-group label { display: block; font-size: 13px; font-weight: 500; color: var(--text-dim); margin-bottom: 6px; }
+        .form-group input {
+            width: 100%; padding: 12px 16px; background: var(--bg);
+            border: 1px solid var(--border); border-radius: 8px;
+            color: var(--text); font-size: 15px; font-family: var(--font);
+            transition: border 0.2s;
+        }
+        .form-group input:focus { outline: none; border-color: var(--accent); }
+        .btn {
+            padding: 12px 24px; border-radius: 8px; border: none;
+            font-family: var(--font); font-weight: 600; font-size: 14px;
+            cursor: pointer; transition: all 0.2s;
+        }
+        .btn-primary {
+            background: var(--accent); color: white; width: 100%;
+        }
+        .btn-primary:hover { background: #dc2626; transform: translateY(-1px); }
+        .btn-sm { padding: 8px 16px; font-size: 13px; }
+        .btn-outline {
+            background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+        }
+        .btn-outline:hover { border-color: var(--text); color: var(--text); }
+        .btn-green { background: var(--green); color: white; }
+        .btn-green:hover { background: #16a34a; }
+        .login-error { color: var(--accent); font-size: 13px; margin-top: 12px; display: none; }
+
+        /* === LAYOUT PRINCIPAL === */
+        .app { display: none; }
+        .app.active { display: flex; height: 100vh; }
+        .sidebar {
+            width: 240px; background: var(--surface); border-right: 1px solid var(--border);
+            display: flex; flex-direction: column; flex-shrink: 0;
+        }
+        .sidebar-header {
+            padding: 20px 20px 16px; border-bottom: 1px solid var(--border);
+        }
+        .sidebar-header h2 { font-size: 18px; font-weight: 700; }
+        .sidebar-header .rol-badge {
+            display: inline-block; font-size: 11px; font-weight: 600;
+            padding: 2px 8px; border-radius: 4px; margin-top: 4px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .rol-admin { background: rgba(139,92,246,0.2); color: var(--purple); }
+        .rol-policia { background: rgba(59,130,246,0.2); color: var(--blue); }
+        .rol-ambulancia { background: rgba(34,197,94,0.2); color: var(--green); }
+        .rol-bomberos { background: rgba(245,158,11,0.2); color: var(--amber); }
+        .rol-cuidador { background: rgba(148,163,184,0.2); color: var(--text-dim); }
+
+        .nav { flex: 1; padding: 12px; }
+        .nav-item {
+            display: flex; align-items: center; gap: 10px;
+            padding: 10px 14px; border-radius: 8px; cursor: pointer;
+            color: var(--text-dim); font-size: 14px; font-weight: 500;
+            transition: all 0.15s; margin-bottom: 2px;
+        }
+        .nav-item:hover { background: var(--surface2); color: var(--text); }
+        .nav-item.active { background: var(--accent-glow); color: var(--accent); }
+        .nav-item .icon { font-size: 18px; width: 24px; text-align: center; }
+        .nav-item .badge-count {
+            margin-left: auto; background: var(--accent); color: white;
+            font-size: 11px; font-weight: 700; padding: 2px 7px;
+            border-radius: 10px; min-width: 22px; text-align: center;
+        }
+        .sidebar-footer {
+            padding: 12px; border-top: 1px solid var(--border);
+        }
+        .sidebar-footer .user-info {
+            font-size: 13px; color: var(--text-dim); padding: 8px 14px;
+        }
+
+        /* === CONTENT === */
+        .content { flex: 1; overflow-y: auto; padding: 0; }
+        .page { display: none; padding: 28px 32px; }
+        .page.active { display: block; }
+        .page-header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 24px;
+        }
+        .page-header h1 { font-size: 24px; font-weight: 700; }
+
+        /* === CARDS === */
+        .stats-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px; margin-bottom: 28px;
+        }
+        .stat-card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 20px;
+        }
+        .stat-card .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+        .stat-card .value { font-size: 32px; font-weight: 700; font-family: var(--mono); }
+        .stat-card .value.red { color: var(--accent); }
+        .stat-card .value.green { color: var(--green); }
+        .stat-card .value.amber { color: var(--amber); }
+        .stat-card .value.blue { color: var(--blue); }
+
+        /* === TABLE === */
+        .table-container {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); overflow: hidden;
+        }
+        .table-toolbar {
+            display: flex; gap: 10px; padding: 16px; border-bottom: 1px solid var(--border);
+            flex-wrap: wrap; align-items: center;
+        }
+        .table-toolbar select, .table-toolbar input {
+            padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
+            border-radius: 6px; color: var(--text); font-family: var(--font); font-size: 13px;
+        }
+        table { width: 100%; border-collapse: collapse; }
+        th {
+            text-align: left; padding: 12px 16px; font-size: 11px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+            color: var(--text-dim); border-bottom: 1px solid var(--border);
+            font-weight: 600;
+        }
+        td {
+            padding: 12px 16px; font-size: 14px;
+            border-bottom: 1px solid var(--border);
+        }
+        tr:hover { background: var(--surface2); }
+        .nivel-badge {
+            display: inline-block; padding: 3px 10px; border-radius: 20px;
+            font-size: 12px; font-weight: 600;
+        }
+        .nivel-1 { background: rgba(59,130,246,0.15); color: var(--blue); }
+        .nivel-2 { background: rgba(245,158,11,0.15); color: var(--amber); }
+        .nivel-3 { background: rgba(239,68,68,0.15); color: var(--accent); }
+        .estado-badge { font-size: 12px; font-weight: 600; }
+        .estado-no { color: var(--accent); }
+        .estado-si { color: var(--green); }
+
+        /* === MAP === */
+        .map-container {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); overflow: hidden; height: calc(100vh - 140px);
+        }
+        #mapa-alertas { height: 100%; width: 100%; }
+        .map-legend {
+            position: absolute; bottom: 20px; left: 20px; z-index: 1000;
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 8px; padding: 12px 16px; font-size: 12px;
+        }
+        .map-legend .legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+
+        /* === CHARTS === */
+        .charts-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 28px;
+        }
+        .chart-card {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 20px;
+        }
+        .chart-card h3 { font-size: 14px; font-weight: 600; margin-bottom: 16px; color: var(--text-dim); }
+
+        /* === MODAL === */
+        .modal-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+            z-index: 9999; align-items: center; justify-content: center;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 16px; padding: 32px; width: 480px; max-width: 90vw;
+            max-height: 80vh; overflow-y: auto;
+        }
+        .modal h2 { font-size: 20px; margin-bottom: 20px; }
+
+        /* === RESPONSIVE === */
+        @media (max-width: 768px) {
+            .sidebar { width: 60px; }
+            .sidebar .nav-item span, .sidebar-header h2, .sidebar-header .rol-badge,
+            .sidebar-footer .user-info { display: none; }
+            .nav-item { justify-content: center; padding: 12px; }
+            .nav-item .badge-count { display: none; }
+            .charts-grid { grid-template-columns: 1fr; }
+            .page { padding: 16px; }
+        }
+
+        /* === ANIMATIONS === */
+        @keyframes pulse-red { 0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); } 50% { box-shadow: 0 0 0 8px rgba(239,68,68,0); } }
+        .pulse-alert { animation: pulse-red 2s infinite; }
+
+        /* === SCROLLBAR === */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+        .loading { display: flex; align-items: center; justify-content: center; padding: 40px; color: var(--text-dim); }
+        .empty-state { text-align: center; padding: 60px 20px; color: var(--text-dim); }
+        .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+
+        /* Pagination */
+        .pagination { display: flex; gap: 6px; padding: 16px; justify-content: center; }
+        .pagination button {
+            padding: 6px 12px; background: var(--surface2); border: 1px solid var(--border);
+            border-radius: 6px; color: var(--text-dim); cursor: pointer; font-family: var(--font);
+        }
+        .pagination button.active { background: var(--accent); color: white; border-color: var(--accent); }
+    </style>
+</head>
+<body>
+
+<!-- ======================== LOGIN ======================== -->
+<div class="login-screen" id="loginScreen">
+    <div class="login-card">
+        <h1>Ami <span class="sos-badge">SOS</span></h1>
+        <p class="subtitle">Panel de Control — Ingresa con tus credenciales</p>
+        <div class="form-group">
+            <label>Email</label>
+            <input type="email" id="loginEmail" placeholder="admin@amisos.co" autocomplete="email">
+        </div>
+        <div class="form-group">
+            <label>Contraseña</label>
+            <input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password">
+        </div>
+        <button class="btn btn-primary" onclick="login()">Ingresar</button>
+        <p class="login-error" id="loginError"></p>
+    </div>
+</div>
+
+<!-- ======================== APP ======================== -->
+<div class="app" id="appMain">
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <h2>Ami SOS</h2>
+            <span class="rol-badge" id="rolBadge"></span>
+        </div>
+        <div class="nav" id="navMenu"></div>
+        <div class="sidebar-footer">
+            <div class="user-info" id="userName"></div>
+            <div class="nav-item" onclick="logout()" style="color:var(--accent)">
+                <span class="icon">⏻</span> <span>Cerrar sesión</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Content -->
+    <div class="content">
+        <!-- MAPA -->
+        <div class="page" id="page-mapa">
+            <div class="page-header">
+                <h1>Mapa en Tiempo Real</h1>
+                <button class="btn btn-sm btn-outline" onclick="refreshMapa()">⟲ Actualizar</button>
+            </div>
+            <div class="map-container" style="position:relative;">
+                <div id="mapa-alertas"></div>
+            </div>
+        </div>
+
+        <!-- ALERTAS -->
+        <div class="page" id="page-alertas">
+            <div class="page-header">
+                <h1>Historial de Alertas</h1>
+            </div>
+            <div class="table-container">
+                <div class="table-toolbar">
+                    <select id="filtro-estado" onchange="loadAlertas()">
+                        <option value="">Todas</option>
+                        <option value="no_atendida">No atendidas</option>
+                        <option value="atendida">Atendidas</option>
+                    </select>
+                    <select id="filtro-tipo" onchange="loadAlertas()">
+                        <option value="">Todo tipo</option>
+                        <option value="salud">Salud</option>
+                        <option value="seguridad">Seguridad</option>
+                        <option value="violencia">Violencia</option>
+                        <option value="incendio">Incendio</option>
+                        <option value="caida">Caída</option>
+                        <option value="emergencia">Emergencia</option>
+                        <option value="otro">Otro</option>
+                    </select>
+                    <select id="filtro-nivel" onchange="loadAlertas()">
+                        <option value="">Todo nivel</option>
+                        <option value="1">Nivel 1 — Leve</option>
+                        <option value="2">Nivel 2 — Grave</option>
+                        <option value="3">Nivel 3 — Crítica</option>
+                    </select>
+                </div>
+                <div id="alertas-table-body"></div>
+                <div class="pagination" id="alertas-pagination"></div>
+            </div>
+        </div>
+
+        <!-- DASHBOARD -->
+        <div class="page" id="page-dashboard">
+            <div class="page-header">
+                <h1>Dashboard</h1>
+            </div>
+            <div class="stats-grid" id="stats-grid"></div>
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <h3>Alertas últimos 7 días</h3>
+                    <canvas id="chart-dias" height="200"></canvas>
+                </div>
+                <div class="chart-card">
+                    <h3>Por tipo de alerta</h3>
+                    <canvas id="chart-tipos" height="200"></canvas>
+                </div>
+                <div class="chart-card">
+                    <h3>Por nivel de emergencia</h3>
+                    <canvas id="chart-niveles" height="200"></canvas>
+                </div>
+                <div class="chart-card">
+                    <h3>Por fuente</h3>
+                    <canvas id="chart-fuentes" height="200"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- USUARIOS -->
+        <div class="page" id="page-usuarios">
+            <div class="page-header">
+                <h1>Gestión de Usuarios</h1>
+                <button class="btn btn-sm btn-green" onclick="showCrearUsuario()">+ Nuevo usuario</button>
+            </div>
+            <div class="table-container">
+                <div id="usuarios-table-body"></div>
+            </div>
+        </div>
+
+        <!-- AUDITORIA -->
+        <div class="page" id="page-auditoria">
+            <div class="page-header">
+                <h1>Auditoría</h1>
+            </div>
+            <div class="table-container">
+                <div id="auditoria-table-body"><div class="loading">Cargando registros...</div></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ======================== MODALES ======================== -->
+<div class="modal-overlay" id="modalOverlay">
+    <div class="modal" id="modalContent"></div>
+</div>
+
+<script>
+// ======================== CONFIG ========================
+const API = ''; // Relativo al mismo host de Render
+let TOKEN = localStorage.getItem('panel_token');
+let USER = JSON.parse(localStorage.getItem('panel_user') || 'null');
+let mapaInstance = null;
+let markersLayer = null;
+let chartInstances = {};
+let alertasPage = 1;
+
+// ======================== API HELPER ========================
+async function api(path, opts = {}) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
+    
+    const res = await fetch(`${API}${path}`, { ...opts, headers: { ...headers, ...opts.headers } });
+    const data = await res.json();
+    
+    if (res.status === 401) {
+        logout();
+        throw new Error('Sesión expirada');
+    }
+    if (!res.ok) throw new Error(data.detail || data.error || 'Error');
+    return data;
+}
+
+// ======================== AUTH ========================
+async function login() {
+    const email = document.getElementById('loginEmail').value;
+    const pass = document.getElementById('loginPass').value;
+    const err = document.getElementById('loginError');
+    
+    if (!email || !pass) { err.textContent = 'Completa todos los campos'; err.style.display = 'block'; return; }
+    
+    try {
+        const data = await api('/panel/login', {
+            method: 'POST',
+            body: JSON.stringify({ email, password: pass })
+        });
+        
+        TOKEN = data.token;
+        USER = data.usuario;
+        localStorage.setItem('panel_token', TOKEN);
+        localStorage.setItem('panel_user', JSON.stringify(USER));
+        err.style.display = 'none';
+        initApp();
+    } catch (e) {
+        err.textContent = e.message;
+        err.style.display = 'block';
+    }
+}
+
+function logout() {
+    api('/panel/logout', { method: 'POST' }).catch(() => {});
+    TOKEN = null; USER = null;
+    localStorage.removeItem('panel_token');
+    localStorage.removeItem('panel_user');
+    document.getElementById('loginScreen').style.display = 'flex';
+    document.getElementById('appMain').classList.remove('active');
+}
+
+// ======================== INIT APP ========================
+function initApp() {
+    if (!TOKEN || !USER) return;
+    
+    document.getElementById('loginScreen').style.display = 'none';
+    document.getElementById('appMain').classList.add('active');
+    
+    // Rol badge
+    const badge = document.getElementById('rolBadge');
+    badge.textContent = USER.rol.toUpperCase();
+    badge.className = `rol-badge rol-${USER.rol}`;
+    
+    document.getElementById('userName').textContent = USER.nombre;
+    
+    buildNav();
+    navigate('mapa');
+}
+
+function buildNav() {
+    const menu = document.getElementById('navMenu');
+    const items = [
+        { id: 'mapa', icon: '📍', label: 'Mapa en Tiempo Real', roles: ['admin', 'policia', 'ambulancia', 'bomberos'] },
+        { id: 'alertas', icon: '🚨', label: 'Historial Alertas', roles: ['admin', 'policia', 'ambulancia', 'bomberos', 'cuidador'] },
+        { id: 'dashboard', icon: '📊', label: 'Dashboard', roles: ['admin'] },
+        { id: 'usuarios', icon: '👥', label: 'Usuarios', roles: ['admin'] },
+        { id: 'auditoria', icon: '📋', label: 'Auditoría', roles: ['admin'] },
+    ];
+    
+    menu.innerHTML = items
+        .filter(i => i.roles.includes(USER.rol))
+        .map(i => `<div class="nav-item" data-page="${i.id}" onclick="navigate('${i.id}')">
+            <span class="icon">${i.icon}</span>
+            <span>${i.label}</span>
+            ${i.id === 'alertas' ? '<span class="badge-count" id="badge-alertas" style="display:none"></span>' : ''}
+        </div>`).join('');
+}
+
+function navigate(pageId) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    
+    const page = document.getElementById(`page-${pageId}`);
+    if (page) page.classList.add('active');
+    
+    const nav = document.querySelector(`.nav-item[data-page="${pageId}"]`);
+    if (nav) nav.classList.add('active');
+    
+    // Load data
+    if (pageId === 'mapa') initMapa();
+    else if (pageId === 'alertas') loadAlertas();
+    else if (pageId === 'dashboard') loadDashboard();
+    else if (pageId === 'usuarios') loadUsuarios();
+    else if (pageId === 'auditoria') loadAuditoria();
+}
+
+// ======================== MAPA ========================
+function initMapa() {
+    if (!mapaInstance) {
+        mapaInstance = L.map('mapa-alertas').setView([4.6097, -74.0817], 12); // Bogotá
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '© OpenStreetMap © CARTO',
+            maxZoom: 19
+        }).addTo(mapaInstance);
+        markersLayer = L.layerGroup().addTo(mapaInstance);
+    }
+    
+    setTimeout(() => mapaInstance.invalidateSize(), 100);
+    refreshMapa();
+}
+
+async function refreshMapa() {
+    try {
+        const data = await api('/panel/mapa/alertas-activas');
+        markersLayer.clearLayers();
+        
+        const colorMap = {
+            1: '#3b82f6', 2: '#f59e0b', 3: '#ef4444'
+        };
+        const iconMap = {
+            salud: '🏥', seguridad: '🚔', violencia: '⚠️',
+            incendio: '🔥', caida: '🤕', emergencia: '🆘', otro: '📍'
+        };
+        
+        data.alertas.forEach(a => {
+            const color = colorMap[a.nivel_emergencia] || '#94a3b8';
+            const icon = iconMap[a.tipo_alerta] || '📍';
+            const ago = timeAgo(a.fecha_hora);
+            
+            const marker = L.circleMarker([a.latitud, a.longitud], {
+                radius: a.nivel_emergencia === 3 ? 12 : 8,
+                fillColor: color,
+                color: color,
+                weight: 2,
+                opacity: 0.9,
+                fillOpacity: 0.4,
+                className: a.nivel_emergencia === 3 ? 'pulse-alert' : ''
+            });
+            
+            marker.bindPopup(`
+                <div style="font-family:DM Sans;font-size:13px;min-width:200px;">
+                    <strong>${icon} ${a.tipo_alerta.toUpperCase()}</strong> — Nivel ${a.nivel_emergencia}<br>
+                    <span style="color:#888">${a.nombre || 'Anónimo'} · ${ago}</span><br>
+                    <span style="color:#888">Fuente: ${a.fuente_alerta || 'N/A'}</span><br>
+                    <button onclick="atenderAlerta(${a.id})" style="margin-top:8px;padding:4px 12px;background:#22c55e;color:white;border:none;border-radius:4px;cursor:pointer;">✓ Atender</button>
+                </div>
+            `);
+            
+            markersLayer.addLayer(marker);
+        });
+        
+        // Actualizar badge
+        const badge = document.getElementById('badge-alertas');
+        if (badge && data.alertas.length > 0) {
+            badge.textContent = data.alertas.length;
+            badge.style.display = 'inline';
+        }
+        
+        // Red comunitaria (solo admin)
+        if (USER.rol === 'admin') {
+            try {
+                const red = await api('/panel/mapa/red-comunitaria');
+                red.miembros.forEach(m => {
+                    L.circleMarker([m.latitud, m.longitud], {
+                        radius: 4, fillColor: '#22c55e', color: '#22c55e',
+                        weight: 1, opacity: 0.6, fillOpacity: 0.3,
+                    }).bindPopup(`<span style="font-size:12px">Red comunitaria<br>${m.celular}</span>`)
+                    .addTo(markersLayer);
+                });
+            } catch(e) {}
+        }
+    } catch (e) {
+        console.error('Error mapa:', e);
+    }
+}
+
+// ======================== ALERTAS ========================
+async function loadAlertas() {
+    const estado = document.getElementById('filtro-estado')?.value || '';
+    const tipo = document.getElementById('filtro-tipo')?.value || '';
+    const nivel = document.getElementById('filtro-nivel')?.value || '';
+    
+    const params = new URLSearchParams({ page: alertasPage, limit: 30 });
+    if (estado) params.set('estado', estado);
+    if (tipo) params.set('tipo', tipo);
+    if (nivel) params.set('nivel', nivel);
+    
+    try {
+        const data = await api(`/panel/alertas?${params}`);
+        renderAlertasTable(data);
+    } catch (e) {
+        document.getElementById('alertas-table-body').innerHTML = `<div class="empty-state"><div class="icon">⚠️</div>${e.message}</div>`;
+    }
+}
+
+function renderAlertasTable(data) {
+    const container = document.getElementById('alertas-table-body');
+    
+    if (!data.alertas.length) {
+        container.innerHTML = '<div class="empty-state"><div class="icon">✅</div>Sin alertas</div>';
+        return;
+    }
+    
+    container.innerHTML = `<table>
+        <thead><tr>
+            <th>ID</th><th>Fecha</th><th>Tipo</th><th>Nivel</th>
+            <th>Nombre</th><th>Fuente</th><th>Estado</th><th>Acciones</th>
+        </tr></thead>
+        <tbody>${data.alertas.map(a => `<tr>
+            <td style="font-family:var(--mono);font-size:12px">#${a.id}</td>
+            <td style="font-size:13px">${formatDate(a.fecha_hora)}</td>
+            <td>${a.tipo_alerta || '—'}</td>
+            <td><span class="nivel-badge nivel-${a.nivel_emergencia || 1}">Nivel ${a.nivel_emergencia || '?'}</span></td>
+            <td>${a.nombre || 'Anónimo'}</td>
+            <td style="font-size:12px;color:var(--text-dim)">${a.fuente_alerta || '—'}</td>
+            <td><span class="estado-badge estado-${a.atendida}">${a.atendida === 'si' ? '✓ Atendida' : '⏳ Pendiente'}</span></td>
+            <td>
+                <button class="btn btn-sm btn-outline" onclick="verDetalle(${a.id})">Ver</button>
+                ${a.atendida === 'no' ? `<button class="btn btn-sm btn-green" onclick="atenderAlerta(${a.id})" style="margin-left:4px">Atender</button>` : ''}
+            </td>
+        </tr>`).join('')}</tbody>
+    </table>`;
+    
+    // Pagination
+    const pag = document.getElementById('alertas-pagination');
+    let html = '';
+    for (let i = 1; i <= data.pages; i++) {
+        html += `<button class="${i === data.page ? 'active' : ''}" onclick="alertasPage=${i};loadAlertas()">${i}</button>`;
+    }
+    pag.innerHTML = html;
+}
+
+async function atenderAlerta(id) {
+    try {
+        await api(`/panel/alertas/${id}/atender`, { method: 'POST' });
+        loadAlertas();
+        refreshMapa();
+    } catch (e) { alert(e.message); }
+}
+
+async function verDetalle(id) {
+    try {
+        const data = await api(`/panel/alertas/${id}`);
+        const a = data.alerta;
+        
+        let evidHtml = '';
+        try {
+            const evid = await api(`/panel/evidencias/${id}`);
+            if (evid.evidencias.length) {
+                evidHtml = `<h3 style="margin-top:16px;font-size:14px">Evidencias (${evid.total})</h3>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+                    ${evid.evidencias.map(e => `<img src="${e.url}" style="width:120px;height:90px;object-fit:cover;border-radius:6px;border:1px solid var(--border)" onerror="this.style.display='none'">`).join('')}
+                    </div>`;
+            }
+        } catch(e) {}
+        
+        showModal(`
+            <h2>Alerta #${a.id}</h2>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:14px">
+                <div><strong>Tipo:</strong> ${a.tipo_alerta}</div>
+                <div><strong>Nivel:</strong> <span class="nivel-badge nivel-${a.nivel_emergencia}">Nivel ${a.nivel_emergencia}</span></div>
+                <div><strong>Nombre:</strong> ${a.nombre || 'Anónimo'}</div>
+                <div><strong>Celular:</strong> ${a.celular || '—'}</div>
+                <div><strong>Fecha:</strong> ${formatDate(a.fecha_hora)}</div>
+                <div><strong>Estado:</strong> ${a.atendida === 'si' ? '✓ Atendida' : '⏳ Pendiente'}</div>
+                <div><strong>Fuente:</strong> ${a.fuente_alerta || '—'}</div>
+                <div><strong>Receptor:</strong> ${a.receptor_destino || '—'}</div>
+            </div>
+            ${a.mensaje ? `<div style="margin-top:12px;padding:12px;background:var(--bg);border-radius:8px;font-size:13px">${a.mensaje}</div>` : ''}
+            ${a.latitud ? `<div style="margin-top:12px;font-size:13px;color:var(--text-dim)">📍 ${a.latitud}, ${a.longitud}
+                <a href="https://maps.google.com/?q=${a.latitud},${a.longitud}" target="_blank" style="color:var(--blue);margin-left:8px">Abrir en Maps</a>
+            </div>` : ''}
+            ${evidHtml}
+            <div style="margin-top:20px;display:flex;gap:8px">
+                ${a.atendida === 'no' ? `<button class="btn btn-green" onclick="atenderAlerta(${a.id});closeModal()">✓ Marcar atendida</button>` : ''}
+                <button class="btn btn-outline" onclick="closeModal()">Cerrar</button>
+            </div>
+        `);
+    } catch (e) { alert(e.message); }
+}
+
+// ======================== DASHBOARD ========================
+async function loadDashboard() {
+    try {
+        const data = await api('/panel/dashboard');
+        const s = data.stats;
+        
+        document.getElementById('stats-grid').innerHTML = `
+            <div class="stat-card"><div class="label">Total alertas</div><div class="value blue">${s.total_alertas}</div></div>
+            <div class="stat-card"><div class="label">Alertas hoy</div><div class="value amber">${s.alertas_hoy}</div></div>
+            <div class="stat-card"><div class="label">Sin atender</div><div class="value red">${s.no_atendidas}</div></div>
+            <div class="stat-card"><div class="label">Red activa</div><div class="value green">${s.red_activa}</div></div>
+        `;
+        
+        // Gráficas
+        renderChart('chart-dias', 'bar', {
+            labels: s.por_dia.map(d => d.dia.slice(5)),
+            datasets: [{ label: 'Alertas', data: s.por_dia.map(d => d.total),
+                backgroundColor: 'rgba(239,68,68,0.6)', borderRadius: 4 }]
+        });
+        
+        renderChart('chart-tipos', 'doughnut', {
+            labels: s.por_tipo.map(t => t.tipo_alerta || 'N/A'),
+            datasets: [{ data: s.por_tipo.map(t => t.total),
+                backgroundColor: ['#ef4444','#f59e0b','#3b82f6','#22c55e','#8b5cf6','#ec4899'] }]
+        });
+        
+        renderChart('chart-niveles', 'bar', {
+            labels: s.por_nivel.map(n => `Nivel ${n.nivel_emergencia}`),
+            datasets: [{ label: 'Alertas', data: s.por_nivel.map(n => n.total),
+                backgroundColor: ['#3b82f6','#f59e0b','#ef4444'], borderRadius: 4 }]
+        });
+        
+        renderChart('chart-fuentes', 'doughnut', {
+            labels: s.por_fuente.map(f => f.fuente_alerta || 'N/A'),
+            datasets: [{ data: s.por_fuente.map(f => f.total),
+                backgroundColor: ['#8b5cf6','#22c55e','#f59e0b','#3b82f6'] }]
+        });
+    } catch (e) {
+        document.getElementById('stats-grid').innerHTML = `<div class="empty-state">${e.message}</div>`;
+    }
+}
+
+function renderChart(canvasId, type, data) {
+    if (chartInstances[canvasId]) chartInstances[canvasId].destroy();
+    const ctx = document.getElementById(canvasId);
+    if (!ctx) return;
+    
+    chartInstances[canvasId] = new Chart(ctx, {
+        type, data,
+        options: {
+            responsive: true,
+            plugins: {
+                legend: { display: type === 'doughnut', position: 'bottom',
+                    labels: { color: '#94a3b8', font: { size: 11 } } }
+            },
+            scales: type !== 'doughnut' ? {
+                y: { ticks: { color: '#94a3b8' }, grid: { color: '#1e293b' } },
+                x: { ticks: { color: '#94a3b8' }, grid: { display: false } }
+            } : {}
+        }
+    });
+}
+
+// ======================== USUARIOS ========================
+async function loadUsuarios() {
+    try {
+        const data = await api('/panel/usuarios');
+        const container = document.getElementById('usuarios-table-body');
+        
+        container.innerHTML = `<table>
+            <thead><tr><th>ID</th><th>Nombre</th><th>Email</th><th>Rol</th><th>Último login</th><th>Estado</th><th>Acciones</th></tr></thead>
+            <tbody>${data.usuarios.map(u => `<tr>
+                <td style="font-family:var(--mono);font-size:12px">${u.id}</td>
+                <td>${u.nombre}</td>
+                <td style="font-size:13px;color:var(--text-dim)">${u.email}</td>
+                <td><span class="rol-badge rol-${u.rol}">${u.rol}</span></td>
+                <td style="font-size:13px">${u.ultimo_login ? formatDate(u.ultimo_login) : 'Nunca'}</td>
+                <td style="color:${u.activo ? 'var(--green)' : 'var(--accent)'}">${u.activo ? 'Activo' : 'Inactivo'}</td>
+                <td><button class="btn btn-sm btn-outline" onclick="toggleUsuario(${u.id})">${u.activo ? 'Desactivar' : 'Activar'}</button></td>
+            </tr>`).join('')}</tbody>
+        </table>`;
+    } catch (e) {
+        document.getElementById('usuarios-table-body').innerHTML = `<div class="empty-state">${e.message}</div>`;
+    }
+}
+
+function showCrearUsuario() {
+    showModal(`
+        <h2>Crear Usuario</h2>
+        <div class="form-group"><label>Nombre</label><input id="nu-nombre" placeholder="Nombre completo"></div>
+        <div class="form-group"><label>Email</label><input id="nu-email" type="email" placeholder="email@ejemplo.com"></div>
+        <div class="form-group"><label>Contraseña</label><input id="nu-pass" type="password" placeholder="Mínimo 8 caracteres"></div>
+        <div class="form-group"><label>Rol</label>
+            <select id="nu-rol" style="width:100%;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--font)">
+                <option value="cuidador">Cuidador</option>
+                <option value="policia">Policía</option>
+                <option value="ambulancia">Ambulancia</option>
+                <option value="bomberos">Bomberos</option>
+                <option value="admin">Administrador</option>
+            </select>
+        </div>
+        <div class="form-group"><label>Celular (opcional)</label><input id="nu-cel" placeholder="3001234567"></div>
+        <div style="display:flex;gap:8px;margin-top:20px">
+            <button class="btn btn-green" onclick="crearUsuario()">Crear</button>
+            <button class="btn btn-outline" onclick="closeModal()">Cancelar</button>
+        </div>
+    `);
+}
+
+async function crearUsuario() {
+    const body = {
+        nombre: document.getElementById('nu-nombre').value,
+        email: document.getElementById('nu-email').value,
+        password: document.getElementById('nu-pass').value,
+        rol: document.getElementById('nu-rol').value,
+        celular: document.getElementById('nu-cel').value || null,
+    };
+    
+    if (!body.nombre || !body.email || !body.password) { alert('Completa los campos obligatorios'); return; }
+    
+    try {
+        await api('/panel/usuarios', { method: 'POST', body: JSON.stringify(body) });
+        closeModal();
+        loadUsuarios();
+    } catch (e) { alert(e.message); }
+}
+
+async function toggleUsuario(id) {
+    try {
+        await api(`/panel/usuarios/${id}/toggle`, { method: 'PUT' });
+        loadUsuarios();
+    } catch (e) { alert(e.message); }
+}
+
+// ======================== AUDITORIA ========================
+async function loadAuditoria() {
+    try {
+        const data = await api('/panel/auditoria?limit=50');
+        const container = document.getElementById('auditoria-table-body');
+        if (!data.registros.length) {
+            container.innerHTML = '<div class="empty-state"><div class="icon">📋</div>Sin registros de auditoría</div>';
+            return;
+        }
+        container.innerHTML = `<table>
+            <thead><tr><th>Fecha</th><th>Usuario</th><th>Rol</th><th>Acción</th><th>Detalle</th><th>IP</th></tr></thead>
+            <tbody>${data.registros.map(r => `<tr>
+                <td style="font-size:13px">${formatDate(r.creado_en)}</td>
+                <td>${r.nombre || '—'}</td>
+                <td><span class="rol-badge rol-${r.rol || 'cuidador'}">${r.rol || '—'}</span></td>
+                <td style="font-family:var(--mono);font-size:12px">${r.accion}</td>
+                <td style="font-size:12px;color:var(--text-dim)">${r.detalle || '—'}</td>
+                <td style="font-size:12px;color:var(--text-dim)">${r.ip_address || '—'}</td>
+            </tr>`).join('')}</tbody>
+        </table>`;
+    } catch (e) {
+        document.getElementById('auditoria-table-body').innerHTML = `<div class="empty-state"><div class="icon">⚠️</div>${e.message}</div>`;
+    }
+}
+
+// ======================== HELPERS ========================
+function formatDate(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return d.toLocaleDateString('es-CO', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function timeAgo(iso) {
+    const diff = (Date.now() - new Date(iso)) / 1000;
+    if (diff < 60) return 'Hace segundos';
+    if (diff < 3600) return `Hace ${Math.floor(diff/60)} min`;
+    if (diff < 86400) return `Hace ${Math.floor(diff/3600)}h`;
+    return `Hace ${Math.floor(diff/86400)}d`;
+}
+
+function showModal(html) {
+    document.getElementById('modalContent').innerHTML = html;
+    document.getElementById('modalOverlay').classList.add('active');
+}
+
+function closeModal() {
+    document.getElementById('modalOverlay').classList.remove('active');
+}
+
+document.getElementById('modalOverlay').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeModal();
+});
+
+// Enter key on login
+document.getElementById('loginPass')?.addEventListener('keyup', (e) => { if (e.key === 'Enter') login(); });
+document.getElementById('loginEmail')?.addEventListener('keyup', (e) => { if (e.key === 'Enter') document.getElementById('loginPass').focus(); });
+
+// ======================== AUTO-REFRESH ========================
+setInterval(() => {
+    if (document.getElementById('page-mapa')?.classList.contains('active')) refreshMapa();
+}, 30000); // Refresh mapa cada 30s
+
+// ======================== INIT ========================
+if (TOKEN && USER) initApp();
+</script>
+</body>
+</html>

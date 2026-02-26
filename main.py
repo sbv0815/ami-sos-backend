@@ -1,5 +1,5 @@
 """
-🆘 AMI SOS - Backend de Emergencias v2.0
+🆘 AMI SOS - Backend de Emergencias v3.1
 FastAPI + PostgreSQL (asyncpg) para Render.com
 
 3 NIVELES DE ALERTA:
@@ -7,28 +7,23 @@ FastAPI + PostgreSQL (asyncpg) para Render.com
   Tipo 2: Emergencia grave → Cuidadores + institucionales 1km
   Tipo 3: Emergencia crítica → Cuidadores + institucionales + RED COMUNITARIA 1km
 
-Endpoints:
-  POST /alerta                → Recibir alerta (app, manilla BLE o relay)
-  POST /alerta/clasificar     → Clasificar emergencia con Claude IA
-  POST /alerta/responder      → Cuidador/institucional/comunidad responde
-  GET  /alerta/{id}           → Estado de una alerta
-  GET  /alerta/{id}/respuestas → Quiénes respondieron
-  POST /usuario/registrar     → Registrar usuario SOS
-  POST /usuario/contactos     → Agregar contacto de confianza
-  POST /token/registrar       → Registrar/actualizar token FCM
-  POST /red/ubicacion         → Actualizar GPS del usuario (red comunitaria)
-  POST /red/relay             → Relay BLE: otro dispositivo reenvía alerta
-  GET  /red/cercanos          → Ver cuántos miembros de la red hay cerca
-  GET  /health                → Health check
+PANEL ADMINISTRATIVO:
+  /panel-app/          → Panel web (HTML estático)
+  /panel/login         → Autenticación por rol
+  /panel/alertas       → Historial filtrado por rol
+  /panel/mapa/*        → Alertas activas + Red comunitaria
+  /panel/dashboard     → Estadísticas (solo admin)
+  /panel/usuarios      → Gestión de cuentas (solo admin)
 
 Autor: TSCAMP SAS
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 import os
 import json
@@ -38,13 +33,15 @@ import logging
 import time
 import asyncpg
 import re
+import secrets
+import bcrypt
 
 # ==================== APP ====================
 
 app = FastAPI(
     title="🆘 Ami SOS API",
-    description="Backend de emergencias — 3 niveles de alerta + red comunitaria",
-    version="2.0.0",
+    description="Backend de emergencias — 3 niveles de alerta + red comunitaria + panel administrativo",
+    version="3.1.0",
 )
 
 app.add_middleware(
@@ -75,6 +72,8 @@ async def get_pool():
             )
     return app.state.pool
 
+# ==================== STARTUP / SHUTDOWN ====================
+
 @app.on_event("startup")
 async def startup():
     try:
@@ -82,6 +81,7 @@ async def startup():
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
         log.info("✅ Conectado a PostgreSQL")
+        await migrar_tablas_panel()
     except Exception as e:
         log.error(f"❌ Error conectando a PostgreSQL: {e}")
 
@@ -96,13 +96,13 @@ class AlertaRequest(BaseModel):
     celular: str
     id_persona: Optional[int] = None
     nombre: Optional[str] = None
-    nivel_emergencia: int = 2           # 1=leve, 2=grave, 3=crítica
-    tipo_alerta: str = "emergencia"     # seguridad, salud, violencia, incendio, caida, otro
-    nivel_alerta: str = "critica"       # leve, critica (legacy)
+    nivel_emergencia: int = 2
+    tipo_alerta: str = "emergencia"
+    nivel_alerta: str = "critica"
     mensaje: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
-    fuente_alerta: str = "app"          # app, manilla_ble, boton_esp32, voz, relay_ble
+    fuente_alerta: str = "app"
     receptor_destino: str = "cuidador"
     audio_base64: Optional[str] = None
     bateria_dispositivo: Optional[int] = None
@@ -111,11 +111,11 @@ class RespuestaAlerta(BaseModel):
     alerta_id: int
     celular: str
     id_persona: Optional[int] = None
-    tipo_respondedor: str = "cuidador"  # cuidador, institucional, comunidad
+    tipo_respondedor: str = "cuidador"
     latitud: Optional[float] = None
     longitud: Optional[float] = None
     tiempo_estimado_min: Optional[int] = None
-    accion: Optional[str] = None        # "voy_en_camino", "llame_123", "grabando_video", "vigilando"
+    accion: Optional[str] = None
 
 class ClasificarRequest(BaseModel):
     texto: Optional[str] = None
@@ -134,7 +134,7 @@ class UsuarioRegistrar(BaseModel):
     alergias: Optional[str] = None
     ciudad: Optional[str] = None
     password_hash: Optional[str] = None
-    disponible_red: bool = True         # Participa en la red comunitaria
+    disponible_red: bool = True
 
 class ContactoConfianza(BaseModel):
     usuario_id: int
@@ -154,37 +154,66 @@ class UbicacionRed(BaseModel):
     id_persona: Optional[int] = None
     latitud: float
     longitud: float
-    disponible: bool = True             # Si está disponible para responder
+    disponible: bool = True
 
 class RelayBLE(BaseModel):
-    mac_manilla: str                    # MAC del dispositivo BLE detectado
-    celular_relay: str                  # Celular de quien detectó la señal
+    mac_manilla: str
+    celular_relay: str
     latitud: float
     longitud: float
-    tipo_alerta_ble: int = 3            # Tipo que transmite la manilla (1,2,3)
-    rssi: Optional[int] = None          # Fuerza de señal BLE
+    tipo_alerta_ble: int = 3
+    rssi: Optional[int] = None
+
+class AlertaBLE(BaseModel):
+    """Alerta unificada desde botón Bluetooth (iTag) de cualquier plataforma."""
+    celular: str
+    plataforma: str = "ami_sos"
+    id_persona: Optional[int] = None
+    nombre: Optional[str] = None
+    nivel_emergencia: int = 2
+    tipo_alerta: str = "emergencia"
+    mensaje: Optional[str] = None
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+    fuente_alerta: str = "boton_ble"
+    bateria_dispositivo: Optional[int] = None
+    mac_dispositivo: Optional[str] = None
 
 class ReporteUsuario(BaseModel):
-    celular_reporta: str                # Quien reporta
-    celular_reportado: str              # A quien reporta
-    motivo: str = "comportamiento"      # comportamiento, acoso, falsa_identidad, spam, otro
+    celular_reporta: str
+    celular_reportado: str
+    motivo: str = "comportamiento"
     descripcion: Optional[str] = None
 
 class VigilanciaRequest(BaseModel):
     celular: str
     nombre: Optional[str] = None
-    descripcion: str                    # Qué vio sospechoso
+    descripcion: str
     latitud: float
     longitud: float
-    tipo_sospecha: str = "general"      # vehiculo, persona, paquete, ruido, otro
+    tipo_sospecha: str = "general"
 
 class VigilanciaConfirmar(BaseModel):
     vigilancia_id: int
     celular: str
-    confirma: bool = True               # True = "yo también lo veo", False = "no veo nada"
+    confirma: bool = True
     comentario: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
+
+# --- Modelos del Panel Administrativo ---
+
+class LoginPanel(BaseModel):
+    email: str
+    password: str
+
+class CrearUsuarioPanel(BaseModel):
+    email: str
+    password: str
+    nombre: str
+    rol: str = "cuidador"
+    tipo_institucional: Optional[str] = None
+    celular: Optional[str] = None
 
 # ==================== UTILIDADES ====================
 
@@ -291,7 +320,6 @@ async def buscar_token(pool, cel_sin: str, cel_con: str, id_persona: int = None)
 # ==================== BUSCAR RED COMUNITARIA 1KM ====================
 
 async def buscar_red_comunitaria(pool, lat: float, lon: float, excluir_celular: str) -> list:
-    """Busca usuarios de Ami SOS disponibles en radio 1km. Excluye bloqueados."""
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT ur.id, ur.celular, ur.nombre, ur.latitud, ur.longitud
@@ -310,14 +338,10 @@ async def buscar_red_comunitaria(pool, lat: float, lon: float, excluir_celular: 
         dist = distancia_km(lat, lon, float(r['latitud']), float(r['longitud']))
         if dist <= 1.0:
             cercanos.append({
-                'id': r['id'],
-                'celular': r['celular'],
+                'id': r['id'], 'celular': r['celular'],
                 'nombre': r['nombre'] or 'Miembro red',
-                'distancia_km': round(dist, 2),
-                'tipo': 'comunidad',
-                'id_persona': None,
+                'distancia_km': round(dist, 2), 'tipo': 'comunidad', 'id_persona': None,
             })
-    
     cercanos.sort(key=lambda x: x['distancia_km'])
     return cercanos
 
@@ -331,7 +355,6 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
     pool = await get_pool()
     cel_sin, cel_con = normalizar_celular(req.celular)
     
-    # Determinar nivel de emergencia
     nivel = req.nivel_emergencia
     if nivel not in (1, 2, 3):
         nivel = 2
@@ -340,13 +363,11 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
     log.info(f"🚨 ALERTA NIVEL {nivel} {etiquetas[nivel]}: tipo={req.tipo_alerta} fuente={req.fuente_alerta} cel={cel_con}")
     
     async with pool.acquire() as conn:
-        # Nombre
         nombre = req.nombre
         if not nombre:
             row = await conn.fetchrow("SELECT nombre FROM usuarios_sos WHERE celular IN ($1,$2) LIMIT 1", cel_sin, cel_con)
             nombre = row['nombre'] if row else 'Usuario'
         
-        # Mensaje según nivel
         hora = datetime.now().strftime('%H:%M')
         if req.mensaje:
             mensaje = req.mensaje
@@ -357,14 +378,12 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
         else:
             mensaje = f"🔴 EMERGENCIA CRÍTICA: {nombre} está en peligro — {req.tipo_alerta} a las {hora}"
         
-        # Mapear tipos
         tipos_ok = ('salud','seguridad','violencia','incendio','caida','otro')
         tipo_db = req.tipo_alerta if req.tipo_alerta in tipos_ok else 'otro'
         nivel_alerta_db = 'leve' if nivel == 1 else 'critica'
         fuente_map = {'app':'manual', 'manilla_ble':'boton', 'boton_esp32':'boton', 'voz':'manual', 'relay_ble':'relay'}
         fuente_db = fuente_map.get(req.fuente_alerta, 'manual')
         
-        # Guardar alerta
         alerta_id = await conn.fetchval("""
             INSERT INTO alertas_panico 
             (nombre, mensaje, fecha_hora, celular, atendida, id_persona, rol,
@@ -378,7 +397,7 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
         
         log.info(f"  💾 Alerta ID: {alerta_id}")
         
-        # ===== NIVEL 1: SOLO CUIDADORES =====
+        # NIVEL 1: SOLO CUIDADORES
         cuidadores = []
         cels_vistos = set()
         
@@ -402,7 +421,7 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
         
         log.info(f"  👥 Cuidadores: {len(cuidadores)}")
         
-        # ===== NIVEL 2+: INSTITUCIONALES 1KM =====
+        # NIVEL 2+: INSTITUCIONALES 1KM
         institucionales = []
         if nivel >= 2 and req.latitud and req.longitud:
             rows = await conn.fetch("""
@@ -433,13 +452,12 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
             institucionales.sort(key=lambda x: x['distancia_km'])
             log.info(f"  🏛️ Institucionales 1km: {len(institucionales)}")
         
-        # ===== NIVEL 3: RED COMUNITARIA 1KM =====
+        # NIVEL 3: RED COMUNITARIA 1KM
         comunidad = []
         if nivel >= 3 and req.latitud and req.longitud:
             comunidad = await buscar_red_comunitaria(pool, req.latitud, req.longitud, cel_con)
             log.info(f"  🤝 Red comunitaria 1km: {len(comunidad)}")
     
-    # Notificaciones en background
     bg.add_task(
         _enviar_notificaciones_v2, pool, alerta_id, nombre, mensaje,
         req.tipo_alerta, nivel, cel_con, cuidadores, institucionales, comunidad,
@@ -449,13 +467,10 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
     ms = round((time.time() - inicio) * 1000)
     
     return {
-        'success': True,
-        'alerta_id': alerta_id,
-        'nivel_emergencia': nivel,
+        'success': True, 'alerta_id': alerta_id, 'nivel_emergencia': nivel,
         'mensaje': 'Alerta procesada',
         'notificados': {
-            'cuidadores': len(cuidadores),
-            'institucionales': len(institucionales),
+            'cuidadores': len(cuidadores), 'institucionales': len(institucionales),
             'red_comunitaria': len(comunidad),
             'total': len(cuidadores) + len(institucionales) + len(comunidad),
         },
@@ -463,8 +478,7 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
             {'nombre': i['nombre'], 'entidad': i.get('entidad',''), 'distancia_km': i['distancia_km']}
             for i in institucionales[:5]
         ],
-        'comunidad_cercanos': len(comunidad),
-        'tiempo_ms': ms,
+        'comunidad_cercanos': len(comunidad), 'tiempo_ms': ms,
     }
 
 # ==================== ENVIAR NOTIFICACIONES V2 ====================
@@ -472,21 +486,16 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
 async def _enviar_notificaciones_v2(pool, alerta_id, nombre, mensaje, tipo_alerta, nivel,
                                      cel_usuario, cuidadores, institucionales, comunidad, lat, lon):
     notificados = 0
-    
     data_push = {
-        'alerta_id': str(alerta_id),
-        'celular_usuario': cel_usuario,
-        'tipo_alerta': tipo_alerta,
-        'nivel_emergencia': str(nivel),
-        'nombre_usuario': nombre,
-        'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+        'alerta_id': str(alerta_id), 'celular_usuario': cel_usuario,
+        'tipo_alerta': tipo_alerta, 'nivel_emergencia': str(nivel),
+        'nombre_usuario': nombre, 'click_action': 'FLUTTER_NOTIFICATION_CLICK',
     }
     if lat and lon:
         data_push['latitud'] = str(lat)
         data_push['longitud'] = str(lon)
         data_push['maps_url'] = f"https://maps.google.com/?q={lat},{lon}"
     
-    # Construir lista unificada
     todos = []
     for c in cuidadores:
         todos.append({**c, 'rol_dest': 'cuidador'})
@@ -500,22 +509,18 @@ async def _enviar_notificaciones_v2(pool, alerta_id, nombre, mensaje, tipo_alert
         tk = await buscar_token(pool, cs, cc, dest.get('id_persona'))
         token = tk['token']
         
-        # Título según rol
         if dest['rol_dest'] == 'cuidador':
             titulo = f"🚨 {'EMERGENCIA' if nivel >= 2 else 'Alerta'} de {nombre}"
         elif dest['rol_dest'] == 'institucional':
             titulo = f"🚨 Alerta {tipo_alerta.upper()} — Nivel {nivel}"
         else:
-            # Red comunitaria
             dist_txt = f"{dest.get('distancia_km', '?')}km"
             titulo = f"🔴 EMERGENCIA cerca de ti ({dist_txt})"
-            # Mensaje especial para la red
-            mensaje_red = f"{nombre} necesita ayuda a {dist_txt}. Puedes: llamar 123, grabar video como evidencia, o acercarte si es seguro."
+            mensaje = f"{nombre} necesita ayuda a {dist_txt}. Puedes: llamar 123, grabar video como evidencia, o acercarte si es seguro."
         
         ok = False
         if token:
-            msg = mensaje_red if dest['rol_dest'] == 'comunidad' else mensaje
-            result = await enviar_push(token, titulo, msg, data_push)
+            result = await enviar_push(token, titulo, mensaje, data_push)
             ok = result['success']
             if ok:
                 notificados += 1
@@ -526,7 +531,6 @@ async def _enviar_notificaciones_v2(pool, alerta_id, nombre, mensaje, tipo_alert
                     async with pool.acquire() as conn:
                         await conn.execute("UPDATE tokens_fcm SET valido=FALSE, motivo_invalidez='token_invalido', fecha_invalido=NOW() WHERE celular IN ($1,$2)", cs, cc)
         
-        # Registrar envío
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO alertas_enviadas (alerta_id, celular_usuario, nombre_usuario,
@@ -539,7 +543,7 @@ async def _enviar_notificaciones_v2(pool, alerta_id, nombre, mensaje, tipo_alert
     
     log.info(f"  📊 Nivel {nivel}: {notificados}/{len(todos)} notificados")
 
-# ==================== POST /alerta/responder (ACTUALIZADO) ====================
+# ==================== POST /alerta/responder ====================
 
 @app.post("/alerta/responder")
 async def responder_alerta(req: RespuestaAlerta):
@@ -547,12 +551,10 @@ async def responder_alerta(req: RespuestaAlerta):
     cs, cc = normalizar_celular(req.celular)
     
     async with pool.acquire() as conn:
-        # Verificar que la alerta existe
         alerta = await conn.fetchrow("SELECT * FROM alertas_panico WHERE id=$1", req.alerta_id)
         if not alerta:
             raise HTTPException(404, "Alerta no encontrada")
         
-        # Ya respondió?
         if req.id_persona:
             existe = await conn.fetchval(
                 "SELECT id FROM respuestas_institucionales WHERE alerta_id=$1 AND celular IN ($2,$3)",
@@ -560,7 +562,6 @@ async def responder_alerta(req: RespuestaAlerta):
             if existe:
                 raise HTTPException(409, "Ya respondió esta alerta")
         
-        # Obtener nombre del respondedor
         nombre_resp = "Respondedor"
         entidad_resp = req.tipo_respondedor
         
@@ -576,7 +577,6 @@ async def responder_alerta(req: RespuestaAlerta):
                 nombre_resp = usr['nombre']
             entidad_resp = 'Red comunitaria' if req.tipo_respondedor == 'comunidad' else 'Cuidador'
         
-        # Registrar respuesta
         await conn.execute("""
             INSERT INTO respuestas_institucionales 
             (alerta_id, id_persona, celular, entidad, nombre, latitud, longitud, 
@@ -586,17 +586,14 @@ async def responder_alerta(req: RespuestaAlerta):
             req.latitud, req.longitud, req.tiempo_estimado_min,
             req.accion or 'voy_en_camino')
         
-        log.info(f"✅ [{req.tipo_respondedor}] {nombre_resp} responde alerta {req.alerta_id} — acción: {req.accion or 'voy_en_camino'}")
+        log.info(f"✅ [{req.tipo_respondedor}] {nombre_resp} responde alerta {req.alerta_id}")
         
-        # Notificar al usuario que alguien responde
         u_sin, u_con = normalizar_celular(alerta['celular'])
         tk = await buscar_token(pool, u_sin, u_con)
         if tk['token']:
             acciones_txt = {
-                'voy_en_camino': 'va en camino',
-                'llame_123': 'llamó al 123',
-                'grabando_video': 'está grabando evidencia',
-                'vigilando': 'está vigilando la zona',
+                'voy_en_camino': 'va en camino', 'llame_123': 'llamó al 123',
+                'grabando_video': 'está grabando evidencia', 'vigilando': 'está vigilando la zona',
             }
             accion_txt = acciones_txt.get(req.accion, 'responde')
             t_msg = f" (~{req.tiempo_estimado_min} min)" if req.tiempo_estimado_min else ""
@@ -612,16 +609,11 @@ async def responder_alerta(req: RespuestaAlerta):
 
 @app.post("/red/ubicacion")
 async def actualizar_ubicacion(req: UbicacionRed):
-    """Actualiza GPS del usuario para la red comunitaria."""
     pool = await get_pool()
     cs, cc = normalizar_celular(req.celular)
-    
     async with pool.acquire() as conn:
-        # Obtener nombre
         usr = await conn.fetchrow("SELECT id, nombre FROM usuarios_sos WHERE celular IN ($1,$2) LIMIT 1", cs, cc)
         nombre = usr['nombre'] if usr else None
-        
-        # Upsert ubicación
         existe = await conn.fetchval("SELECT id FROM ubicaciones_red WHERE celular=$1", cc)
         if existe:
             await conn.execute("""
@@ -634,285 +626,123 @@ async def actualizar_ubicacion(req: UbicacionRed):
                 INSERT INTO ubicaciones_red (celular, id_persona, nombre, latitud, longitud, disponible)
                 VALUES ($1,$2,$3,$4,$5,$6)
             """, cc, req.id_persona, nombre, req.latitud, req.longitud, req.disponible)
-    
     return {'success': True}
 
 @app.get("/red/cercanos")
 async def ver_cercanos(latitud: float, longitud: float):
-    """Ver cuántos miembros de la red hay en 1km."""
     pool = await get_pool()
-    
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT celular, latitud, longitud
-            FROM ubicaciones_red
-            WHERE disponible = TRUE
-              AND actualizado_at > NOW() - INTERVAL '30 minutes'
+            SELECT celular, latitud, longitud FROM ubicaciones_red
+            WHERE disponible = TRUE AND actualizado_at > NOW() - INTERVAL '30 minutes'
         """)
-    
     cercanos = 0
     for r in rows:
-        dist = distancia_km(latitud, longitud, float(r['latitud']), float(r['longitud']))
-        if dist <= 1.0:
+        if distancia_km(latitud, longitud, float(r['latitud']), float(r['longitud'])) <= 1.0:
             cercanos += 1
-    
     return {'success': True, 'cercanos_1km': cercanos}
 
 # ==================== RELAY BLE ====================
 
 @app.post("/red/relay")
 async def relay_ble(req: RelayBLE, bg: BackgroundTasks):
-    """
-    Otro dispositivo con Ami SOS detectó la manilla BLE de alguien 
-    que perdió su celular. Reenvía la alerta.
-    """
     pool = await get_pool()
-    
     async with pool.acquire() as conn:
-        # Buscar a quién pertenece la manilla
         disp = await conn.fetchrow(
             "SELECT usuario_id, nombre_dispositivo FROM dispositivos_ble WHERE mac_address=$1 AND activo=TRUE",
             req.mac_manilla)
-        
         if not disp:
             raise HTTPException(404, "Dispositivo BLE no registrado")
-        
-        # Obtener datos del dueño
         usuario = await conn.fetchrow("SELECT nombre, celular FROM usuarios_sos WHERE id=$1", disp['usuario_id'])
         if not usuario:
             raise HTTPException(404, "Usuario del dispositivo no encontrado")
-        
-        # Verificar que no haya una alerta reciente del mismo dispositivo (evitar duplicados)
         reciente = await conn.fetchval("""
             SELECT id FROM alertas_panico 
             WHERE celular=$1 AND fuente_alerta='relay' AND fecha_hora > NOW() - INTERVAL '5 minutes'
         """, usuario['celular'])
-        
         if reciente:
             return {'success': True, 'alerta_id': reciente, 'mensaje': 'Alerta ya reportada por relay'}
         
-        log.info(f"📡 RELAY BLE: Manilla {req.mac_manilla} detectada por {req.celular_relay} — dueño: {usuario['nombre']}")
-        
-        # Crear alerta Nivel 3 automáticamente (si perdió el celular, es crítico)
+        log.info(f"📡 RELAY BLE: Manilla {req.mac_manilla} detectada por {req.celular_relay}")
         alerta_req = AlertaRequest(
-            celular=usuario['celular'],
-            nombre=usuario['nombre'],
-            nivel_emergencia=3,
-            tipo_alerta='seguridad',
-            nivel_alerta='critica',
-            mensaje=f"🔴 RELAY: {usuario['nombre']} puede estar en peligro. Señal BLE detectada por otro usuario a las {datetime.now().strftime('%H:%M')}",
-            latitud=req.latitud,
-            longitud=req.longitud,
-            fuente_alerta='relay_ble',
+            celular=usuario['celular'], nombre=usuario['nombre'],
+            nivel_emergencia=3, tipo_alerta='seguridad', nivel_alerta='critica',
+            mensaje=f"🔴 RELAY: {usuario['nombre']} puede estar en peligro. Señal BLE detectada a las {datetime.now().strftime('%H:%M')}",
+            latitud=req.latitud, longitud=req.longitud, fuente_alerta='relay_ble',
         )
-        
         return await recibir_alerta(alerta_req, bg)
-    
+
 # ==================== ENDPOINT UNIFICADO BLE ====================
-# Agregar este bloque al main.py de Ami SOS (FastAPI)
-# Va después del bloque de RELAY BLE y antes de CLASIFICAR CON CLAUDE
-# ==================================================================
-
-# --- Nuevo modelo ---
-
-class AlertaBLE(BaseModel):
-    """Alerta unificada desde botón Bluetooth (iTag) de cualquier plataforma."""
-    celular: str
-    plataforma: str = "ami_sos"          # "ami_sos" o "ami"
-    id_persona: Optional[int] = None
-    nombre: Optional[str] = None
-    nivel_emergencia: int = 2            # 1=leve, 2=grave, 3=crítica
-    tipo_alerta: str = "emergencia"
-    mensaje: Optional[str] = None
-    latitud: Optional[float] = None
-    longitud: Optional[float] = None
-    fuente_alerta: str = "boton_ble"     # Siempre boton_ble desde iTag
-    bateria_dispositivo: Optional[int] = None
-    mac_dispositivo: Optional[str] = None  # MAC del iTag (para log/debug)
-
-# --- URL del backend Ami adultos (PHP/Hostinger) ---
-# Configura esto como variable de entorno en Render:
-#   AMI_ADULTOS_URL=https://tudominio.com/api/enviar_alerta_esp32.php
-#
-# O si tienes un endpoint más limpio:
-#   AMI_ADULTOS_URL=https://tudominio.com/api/alerta
 
 AMI_ADULTOS_URL = os.getenv('AMI_ADULTOS_URL', '')
 
-# --- Endpoint unificado ---
-
 @app.post("/ble/alerta")
 async def alerta_ble_unificada(req: AlertaBLE, bg: BackgroundTasks):
-    """
-    🔵 ENDPOINT UNIFICADO BLE
-    
-    Recibe alertas desde botón Bluetooth (iTag) de AMBAS plataformas:
-    
-    - plataforma="ami_sos" → Procesa internamente (3 niveles, red comunitaria)
-    - plataforma="ami"     → Forward al backend PHP de Ami adultos (cuidador/familia)
-    
-    Usado por:
-    - App Ami SOS (Flutter) → ble_foreground_service.dart / ble_button_service.dart
-    - App Ami adultos (Flutter) → mismo código BLE, diferente plataforma
-    """
     inicio = time.time()
     cel_sin, cel_con = normalizar_celular(req.celular)
     plataforma = req.plataforma.lower().strip()
     
     log.info(f"🔵 BLE ALERTA [{plataforma.upper()}]: cel={cel_con} nivel={req.nivel_emergencia} mac={req.mac_dispositivo or 'N/A'}")
     
-    # ============================================================
-    # RUTA 1: AMI SOS → Procesar internamente (3 niveles)
-    # ============================================================
     if plataforma == "ami_sos":
         log.info(f"  → Procesando en Ami SOS (interno)")
-        
-        # Convertir a AlertaRequest y delegar al endpoint principal
         alerta_req = AlertaRequest(
-            celular=req.celular,
-            id_persona=req.id_persona,
-            nombre=req.nombre,
-            nivel_emergencia=req.nivel_emergencia,
-            tipo_alerta=req.tipo_alerta,
+            celular=req.celular, id_persona=req.id_persona, nombre=req.nombre,
+            nivel_emergencia=req.nivel_emergencia, tipo_alerta=req.tipo_alerta,
             nivel_alerta="critica" if req.nivel_emergencia >= 2 else "leve",
-            mensaje=req.mensaje,
-            latitud=req.latitud,
-            longitud=req.longitud,
-            fuente_alerta="boton",  # Mapear a valor válido de la tabla
-            receptor_destino="cuidador",
+            mensaje=req.mensaje, latitud=req.latitud, longitud=req.longitud,
+            fuente_alerta="boton", receptor_destino="cuidador",
             bateria_dispositivo=req.bateria_dispositivo,
         )
-        
-        # Reutilizar el endpoint /alerta existente
         resultado = await recibir_alerta(alerta_req, bg)
-        
         ms = round((time.time() - inicio) * 1000)
         resultado['plataforma'] = 'ami_sos'
         resultado['fuente'] = 'boton_ble'
         resultado['tiempo_total_ms'] = ms
-        
         return resultado
     
-    # ============================================================
-    # RUTA 2: AMI ADULTOS → Forward al backend PHP (Hostinger)
-    # ============================================================
     elif plataforma == "ami":
         log.info(f"  → Reenviando a Ami adultos (PHP)")
-        
         if not AMI_ADULTOS_URL:
-            log.error("  ❌ AMI_ADULTOS_URL no configurada")
-            raise HTTPException(
-                500, 
-                "Backend Ami adultos no configurado. "
-                "Configura AMI_ADULTOS_URL en las variables de entorno de Render."
-            )
+            raise HTTPException(500, "AMI_ADULTOS_URL no configurada")
         
-        # Construir payload compatible con enviar_alerta_esp32.php
         payload_php = {
-            "celular": cel_con,
-            "id_persona": req.id_persona,
-            "nombre": req.nombre or "",
-            "tipo_alerta": req.tipo_alerta,
+            "celular": cel_con, "id_persona": req.id_persona,
+            "nombre": req.nombre or "", "tipo_alerta": req.tipo_alerta,
             "nivel_alerta": "critica" if req.nivel_emergencia >= 2 else "leve",
-            "mensaje": req.mensaje or "",
-            "latitud": req.latitud,
-            "longitud": req.longitud,
-            "fuente_alerta": "boton",       # PHP espera: boton, caida, manual, etc.
-            "receptor_destino": "cuidador",
-            "rol": "usuario",
+            "mensaje": req.mensaje or "", "latitud": req.latitud, "longitud": req.longitud,
+            "fuente_alerta": "boton", "receptor_destino": "cuidador", "rol": "usuario",
         }
         
-        # Enviar al backend PHP
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    AMI_ADULTOS_URL,
-                    json=payload_php,
-                    timeout=15,
-                    headers={"Content-Type": "application/json"}
-                )
-                
+                resp = await client.post(AMI_ADULTOS_URL, json=payload_php, timeout=15,
+                    headers={"Content-Type": "application/json"})
                 ms = round((time.time() - inicio) * 1000)
-                
                 if resp.status_code == 200:
                     resultado_php = resp.json()
                     log.info(f"  ✅ Ami adultos respondió OK: alerta_id={resultado_php.get('alerta_id')}")
-                    
                     return {
-                        "success": True,
-                        "plataforma": "ami",
-                        "fuente": "boton_ble",
+                        "success": True, "plataforma": "ami", "fuente": "boton_ble",
                         "alerta_id": resultado_php.get("alerta_id"),
                         "mensaje": "Alerta enviada a cuidadores de Ami",
                         "notificados": resultado_php.get("notificados", 0),
-                        "total_cuidadores": resultado_php.get("total_cuidadores", 0),
-                        "backend_response": resultado_php,
-                        "tiempo_total_ms": ms,
+                        "backend_response": resultado_php, "tiempo_total_ms": ms,
                     }
                 else:
-                    log.error(f"  ❌ Ami adultos HTTP {resp.status_code}: {resp.text[:200]}")
-                    
-                    # FALLBACK: Guardar localmente para no perder la alerta
-                    alerta_id_local = await _guardar_alerta_fallback(
-                        req, cel_con, "ami", f"forward_failed_http_{resp.status_code}"
-                    )
-                    
-                    return {
-                        "success": False,
-                        "plataforma": "ami",
-                        "fuente": "boton_ble",
-                        "error": f"Backend Ami adultos respondió HTTP {resp.status_code}",
-                        "fallback_alerta_id": alerta_id_local,
-                        "mensaje": "Alerta guardada localmente como respaldo. Se reintentará.",
-                        "tiempo_total_ms": ms,
-                    }
-                    
+                    alerta_id_local = await _guardar_alerta_fallback(req, cel_con, "ami", f"forward_failed_http_{resp.status_code}")
+                    return {"success": False, "plataforma": "ami", "error": f"HTTP {resp.status_code}",
+                            "fallback_alerta_id": alerta_id_local, "tiempo_total_ms": ms}
         except httpx.TimeoutException:
-            log.error(f"  ❌ Timeout conectando a Ami adultos ({AMI_ADULTOS_URL})")
-            
-            alerta_id_local = await _guardar_alerta_fallback(
-                req, cel_con, "ami", "forward_timeout"
-            )
-            
-            return {
-                "success": False,
-                "plataforma": "ami",
-                "error": "Timeout conectando a backend Ami adultos",
-                "fallback_alerta_id": alerta_id_local,
-                "mensaje": "Alerta guardada localmente como respaldo.",
-            }
-            
+            alerta_id_local = await _guardar_alerta_fallback(req, cel_con, "ami", "forward_timeout")
+            return {"success": False, "plataforma": "ami", "error": "Timeout", "fallback_alerta_id": alerta_id_local}
         except Exception as e:
-            log.error(f"  ❌ Error reenviando a Ami adultos: {e}")
-            
-            alerta_id_local = await _guardar_alerta_fallback(
-                req, cel_con, "ami", f"forward_error: {str(e)[:100]}"
-            )
-            
-            return {
-                "success": False,
-                "plataforma": "ami",
-                "error": str(e),
-                "fallback_alerta_id": alerta_id_local,
-            }
-    
-    # ============================================================
-    # PLATAFORMA DESCONOCIDA
-    # ============================================================
+            alerta_id_local = await _guardar_alerta_fallback(req, cel_con, "ami", f"error: {str(e)[:100]}")
+            return {"success": False, "plataforma": "ami", "error": str(e), "fallback_alerta_id": alerta_id_local}
     else:
-        raise HTTPException(
-            400, 
-            f"Plataforma '{plataforma}' no reconocida. Usa 'ami_sos' o 'ami'."
-        )
-
-
-# --- Función auxiliar: Guardar alerta como fallback ---
+        raise HTTPException(400, f"Plataforma '{plataforma}' no reconocida. Usa 'ami_sos' o 'ami'.")
 
 async def _guardar_alerta_fallback(req: AlertaBLE, cel_con: str, plataforma: str, motivo: str) -> int:
-    """
-    Si el forward a Ami adultos falla, guarda la alerta localmente en PostgreSQL
-    para no perderla. Se puede reintentar después o notificar manualmente.
-    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         alerta_id = await conn.fetchval("""
@@ -923,41 +753,23 @@ async def _guardar_alerta_fallback(req: AlertaBLE, cel_con: str, plataforma: str
             VALUES ($1, $2, NOW(), $3, 'no', $4, 'usuario', $5, $6, $7, $8, 
                     'cuidador', 'boton', $9)
             RETURNING id
-        """, 
-            req.nombre or 'Usuario Ami',
+        """, req.nombre or 'Usuario Ami',
             f"[FALLBACK-{plataforma}] {motivo} — Alerta BLE de {req.nombre or 'Usuario'}",
-            cel_con,
-            req.id_persona,
+            cel_con, req.id_persona,
             req.tipo_alerta if req.tipo_alerta in ('salud','seguridad','violencia','incendio','caida','otro') else 'otro',
-            req.latitud,
-            req.longitud,
-            'critica' if req.nivel_emergencia >= 2 else 'leve',
-            req.nivel_emergencia,
-        )
-        
+            req.latitud, req.longitud,
+            'critica' if req.nivel_emergencia >= 2 else 'leve', req.nivel_emergencia)
         log.warning(f"  💾 FALLBACK: Alerta guardada localmente ID={alerta_id} ({motivo})")
         return alerta_id
 
-
-# ==================== ENDPOINT DE PRUEBA BLE ====================
-
 @app.post("/ble/test")
 async def test_ble_endpoint(req: AlertaBLE):
-    """
-    Endpoint de prueba para verificar conectividad desde la app Flutter.
-    No guarda nada, solo confirma que el endpoint está vivo y los datos llegan bien.
-    """
     cel_sin, cel_con = normalizar_celular(req.celular)
-    
     return {
-        "success": True,
-        "test": True,
-        "mensaje": "Endpoint BLE unificado funcionando correctamente",
+        "success": True, "test": True, "mensaje": "Endpoint BLE unificado funcionando",
         "datos_recibidos": {
-            "celular": cel_con,
-            "plataforma": req.plataforma,
-            "nivel_emergencia": req.nivel_emergencia,
-            "tipo_alerta": req.tipo_alerta,
+            "celular": cel_con, "plataforma": req.plataforma,
+            "nivel_emergencia": req.nivel_emergencia, "tipo_alerta": req.tipo_alerta,
             "tiene_gps": req.latitud is not None and req.longitud is not None,
             "mac_dispositivo": req.mac_dispositivo,
         },
@@ -982,8 +794,7 @@ REPORTE: "{req.texto}"
 Responde SOLO en JSON:
 {{"nivel_emergencia":1-3,"tipo_alerta":"seguridad|salud|violencia|incendio|caida|otro","descripcion_corta":"1 línea","acciones":["acción1","acción2"],"llamar_123":true/false,"llamar_155":true/false,"confianza":0.0-1.0}}
 
-Niveles: 1=leve(cuidadores), 2=grave(+institucionales), 3=crítica(+red comunitaria)
-Reglas: violencia→llamar_155=true+nivel 3, salud grave→llamar_123=true+nivel 2-3, robo armado/secuestro→nivel 3"""
+Niveles: 1=leve(cuidadores), 2=grave(+institucionales), 3=crítica(+red comunitaria)"""
 
     async with httpx.AsyncClient() as client:
         resp = await client.post("https://api.anthropic.com/v1/messages",
@@ -997,32 +808,22 @@ Reglas: violencia→llamar_155=true+nivel 3, salud grave→llamar_123=true+nivel
             return {'success': True, 'clasificacion': json.loads(match.group())}
         raise HTTPException(500, "Error parseando respuesta IA")
 
-# ==================== LOGIN ====================
+# ==================== LOGIN / REGISTRO / CONSULTAS ====================
 
 @app.get("/usuario/login/{celular}")
 async def login_usuario(celular: str):
-    """Verificar si un usuario existe y retornar sus datos."""
     pool = await get_pool()
     cs, cc = normalizar_celular(celular)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, nombre, apellido, celular, ciudad, country_code, bloqueado FROM usuarios_sos WHERE celular IN ($1,$2)",
-            cs, cc)
+            "SELECT id, nombre, apellido, celular, ciudad, country_code, bloqueado FROM usuarios_sos WHERE celular IN ($1,$2)", cs, cc)
         if not row:
             raise HTTPException(404, "User not found")
         if row['bloqueado']:
             raise HTTPException(403, "User blocked")
-        return {
-            'success': True,
-            'id': row['id'],
-            'nombre': row['nombre'],
-            'apellido': row['apellido'],
-            'celular': row['celular'],
-            'ciudad': row['ciudad'],
-            'country_code': row['country_code'],
-        }
-
-# ==================== REGISTRO ====================
+        return {'success': True, 'id': row['id'], 'nombre': row['nombre'],
+                'apellido': row['apellido'], 'celular': row['celular'],
+                'ciudad': row['ciudad'], 'country_code': row['country_code']}
 
 @app.post("/usuario/registrar")
 async def registrar_usuario(req: UsuarioRegistrar):
@@ -1062,8 +863,6 @@ async def registrar_token(req: TokenRegistrar):
             req.id_persona, cc, req.token, req.rol, req.dispositivo_id)
     return {'success': True}
 
-# ==================== CONSULTAS ====================
-
 @app.get("/alerta/{alerta_id}")
 async def obtener_alerta(alerta_id: int):
     pool = await get_pool()
@@ -1073,8 +872,7 @@ async def obtener_alerta(alerta_id: int):
         stats = await conn.fetchrow("SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE estado_envio='enviado') as enviados FROM alertas_enviadas WHERE alerta_id=$1", alerta_id)
         resps = await conn.fetch("SELECT nombre,entidad,celular,fecha_respuesta,tiempo_estimado_min,estado FROM respuestas_institucionales WHERE alerta_id=$1 ORDER BY fecha_respuesta", alerta_id)
     return {
-        'success': True,
-        'alerta': row_to_dict(row),
+        'success': True, 'alerta': row_to_dict(row),
         'notificaciones': {'total': stats['total'], 'enviadas': stats['enviados']},
         'respuestas': [row_to_dict(r) for r in resps],
     }
@@ -1090,172 +888,87 @@ async def obtener_respuestas(alerta_id: int):
 
 @app.post("/vigilancia")
 async def crear_vigilancia(req: VigilanciaRequest):
-    """
-    Ciudadano reporta algo sospechoso.
-    Se notifica a la red comunitaria en 1km.
-    Si 2+ confirman → se escala a policía automáticamente.
-    """
     pool = await get_pool()
     cs, cc = normalizar_celular(req.celular)
-    
     async with pool.acquire() as conn:
-        # Crear registro de vigilancia
         vid = await conn.fetchval("""
             INSERT INTO vigilancias (celular, nombre, descripcion, tipo_sospecha, latitud, longitud)
             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
         """, cc, req.nombre, req.descripcion, req.tipo_sospecha, req.latitud, req.longitud)
     
-    log.info(f"👁 Vigilancia #{vid}: {req.tipo_sospecha} por {cc} en ({req.latitud},{req.longitud})")
-    
-    # Notificar a la red comunitaria cercana
+    log.info(f"👁 Vigilancia #{vid}: {req.tipo_sospecha} por {cc}")
     cercanos = await buscar_red_comunitaria(pool, req.latitud, req.longitud, cc)
     notificados = 0
-    
     for persona in cercanos:
         try:
             token_info = await buscar_token(pool, persona['celular'], persona['celular'])
-            if token_info and 'token' in token_info:
-                await enviar_push(
-                    token_info['token'],
-                    '👁 Suspicious activity nearby',
-                    f'{req.nombre or "Someone"}: {req.descripcion[:80]}',
-                    data={
-                        'tipo': 'vigilancia',
-                        'vigilancia_id': vid,
-                        'nombre': req.nombre or '',
-                        'descripcion': req.descripcion[:100],
-                        'tipo_sospecha': req.tipo_sospecha,
-                        'latitud': req.latitud,
-                        'longitud': req.longitud,
-                    }
-                )
+            if token_info and token_info.get('token'):
+                await enviar_push(token_info['token'], '👁 Actividad sospechosa cerca',
+                    f'{req.nombre or "Alguien"}: {req.descripcion[:80]}',
+                    data={'tipo': 'vigilancia', 'vigilancia_id': vid, 'latitud': req.latitud, 'longitud': req.longitud})
                 notificados += 1
         except Exception as e:
             log.warning(f"  Push error: {e}")
     
-    return {
-        'success': True,
-        'vigilancia_id': vid,
-        'notificados': notificados,
-        'cercanos_total': len(cercanos),
-        'mensaje': f'Watching #{vid} — {notificados} people notified nearby',
-    }
+    return {'success': True, 'vigilancia_id': vid, 'notificados': notificados, 'cercanos_total': len(cercanos)}
 
 @app.post("/vigilancia/confirmar")
 async def confirmar_vigilancia(req: VigilanciaConfirmar):
-    """
-    Vecino confirma o rechaza la sospecha.
-    Si 2+ confirman → se escala a policía automáticamente.
-    """
     pool = await get_pool()
     cs, cc = normalizar_celular(req.celular)
-    
     async with pool.acquire() as conn:
-        # Verificar que la vigilancia existe y está activa
-        vig = await conn.fetchrow(
-            "SELECT * FROM vigilancias WHERE id=$1 AND estado='activa'", req.vigilancia_id)
+        vig = await conn.fetchrow("SELECT * FROM vigilancias WHERE id=$1 AND estado='activa'", req.vigilancia_id)
         if not vig:
-            raise HTTPException(404, "Vigilancia not found or closed")
-        
-        # Registrar confirmación (única por persona)
+            raise HTTPException(404, "Vigilancia no encontrada o cerrada")
         try:
             await conn.execute("""
                 INSERT INTO confirmaciones_vigilancia (vigilancia_id, celular, confirma, comentario, latitud, longitud)
                 VALUES ($1, $2, $3, $4, $5, $6)
             """, req.vigilancia_id, cc, req.confirma, req.comentario, req.latitud, req.longitud)
         except Exception:
-            raise HTTPException(409, "Already confirmed this watch")
+            raise HTTPException(409, "Ya confirmó esta vigilancia")
         
-        # Actualizar conteo
         if req.confirma:
-            await conn.execute(
-                "UPDATE vigilancias SET confirmaciones = confirmaciones + 1 WHERE id=$1", req.vigilancia_id)
+            await conn.execute("UPDATE vigilancias SET confirmaciones = confirmaciones + 1 WHERE id=$1", req.vigilancia_id)
         else:
-            await conn.execute(
-                "UPDATE vigilancias SET rechazos = rechazos + 1 WHERE id=$1", req.vigilancia_id)
+            await conn.execute("UPDATE vigilancias SET rechazos = rechazos + 1 WHERE id=$1", req.vigilancia_id)
         
-        # Leer conteo actualizado
         updated = await conn.fetchrow(
             "SELECT confirmaciones, rechazos, escalada, celular, nombre, latitud, longitud, descripcion FROM vigilancias WHERE id=$1",
             req.vigilancia_id)
         
-        confirmaciones = updated['confirmaciones']
-        escalada = updated['escalada']
-        
-        # AUTO-ESCALAR si 2+ confirmaciones y no ha sido escalada
         alerta_id = None
-        if confirmaciones >= 2 and not escalada:
-            # Crear alerta nivel 2 (involucra policía)
+        if updated['confirmaciones'] >= 2 and not updated['escalada']:
             alerta_id = await conn.fetchval("""
-                INSERT INTO alertas_panico (celular, nombre, nivel_emergencia, tipo_alerta, mensaje, latitud, longitud, fuente_alerta)
-                VALUES ($1, $2, 2, 'sospecha_confirmada', $3, $4, $5, 'vigilancia_comunitaria') RETURNING id
+                INSERT INTO alertas_panico (celular, nombre, nivel_emergencia, tipo_alerta, mensaje, latitud, longitud, fuente_alerta, atendida, fecha_hora)
+                VALUES ($1, $2, 2, 'seguridad', $3, $4, $5, 'vigilancia', 'no', NOW()) RETURNING id
             """, updated['celular'], updated['nombre'],
-                f"Confirmed suspicious activity: {updated['descripcion'][:200]}. {confirmaciones} witnesses.",
+                f"Actividad sospechosa confirmada: {updated['descripcion'][:200]}. {updated['confirmaciones']} testigos.",
                 updated['latitud'], updated['longitud'])
-            
-            # Marcar vigilancia como escalada
-            await conn.execute(
-                "UPDATE vigilancias SET escalada=TRUE, alerta_id=$1 WHERE id=$2",
-                alerta_id, req.vigilancia_id)
-            
-            log.warning(f"🚨 VIGILANCIA #{req.vigilancia_id} ESCALADA → Alerta #{alerta_id} ({confirmaciones} confirmaciones)")
-            
-            # Notificar a institucionales en 1km
-            # Usar la misma lógica de alerta nivel 2
-            from fastapi import BackgroundTasks
-            # La notificación a institucionales la hacemos inline
-            inst_rows = await conn.fetch("""
-                SELECT celular, nombre FROM ubicaciones_red
-                WHERE disponible = TRUE AND latitud IS NOT NULL
-                AND actualizado_at > NOW() - INTERVAL '30 minutes'
-            """)
-            for inst in inst_rows:
-                try:
-                    tk = await buscar_token(pool, inst['celular'], inst['celular'])
-                    if tk and 'token' in tk:
-                        await enviar_push(tk['token'],
-                            '🚨 Confirmed suspicious activity',
-                            f'{confirmaciones} people confirmed. Alert #{alerta_id}',
-                            data={'tipo': 'alerta', 'alerta_id': alerta_id, 'nivel_emergencia': 2,
-                                  'latitud': str(updated['latitud']), 'longitud': str(updated['longitud'])})
-                except: pass
+            await conn.execute("UPDATE vigilancias SET escalada=TRUE, alerta_id=$1 WHERE id=$2", alerta_id, req.vigilancia_id)
+            log.warning(f"🚨 VIGILANCIA #{req.vigilancia_id} ESCALADA → Alerta #{alerta_id}")
     
-    return {
-        'success': True,
-        'confirmaciones': confirmaciones,
-        'rechazos': updated['rechazos'],
-        'escalada': alerta_id is not None,
-        'alerta_id': alerta_id,
-        'mensaje': f'{"ESCALATED to police!" if alerta_id else "Confirmed"} ({confirmaciones}/2 needed)',
-    }
+    return {'success': True, 'confirmaciones': updated['confirmaciones'], 'rechazos': updated['rechazos'],
+            'escalada': alerta_id is not None, 'alerta_id': alerta_id}
 
 @app.get("/vigilancia/{vigilancia_id}")
 async def obtener_vigilancia(vigilancia_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         vig = await conn.fetchrow("SELECT * FROM vigilancias WHERE id=$1", vigilancia_id)
-        if not vig: raise HTTPException(404, "Not found")
-        confs = await conn.fetch(
-            "SELECT celular, confirma, comentario, fecha FROM confirmaciones_vigilancia WHERE vigilancia_id=$1 ORDER BY fecha",
-            vigilancia_id)
-    return {
-        'success': True,
-        'vigilancia': row_to_dict(vig),
-        'confirmaciones': [row_to_dict(c) for c in confs],
-    }
+        if not vig: raise HTTPException(404, "No encontrada")
+        confs = await conn.fetch("SELECT celular, confirma, comentario, fecha FROM confirmaciones_vigilancia WHERE vigilancia_id=$1 ORDER BY fecha", vigilancia_id)
+    return {'success': True, 'vigilancia': row_to_dict(vig), 'confirmaciones': [row_to_dict(c) for c in confs]}
 
 @app.get("/vigilancia/activas")
 async def vigilancias_activas(latitud: float, longitud: float):
-    """Ver vigilancias activas cerca de una ubicación."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, celular, nombre, descripcion, tipo_sospecha, latitud, longitud,
                    confirmaciones, rechazos, escalada, fecha
-            FROM vigilancias
-            WHERE estado = 'activa' AND fecha > NOW() - INTERVAL '2 hours'
+            FROM vigilancias WHERE estado = 'activa' AND fecha > NOW() - INTERVAL '2 hours'
         """)
-    
     cercanas = []
     for r in rows:
         dist = distancia_km(latitud, longitud, float(r['latitud']), float(r['longitud']))
@@ -1263,7 +976,6 @@ async def vigilancias_activas(latitud: float, longitud: float):
             v = row_to_dict(r)
             v['distancia_km'] = round(dist, 2)
             cercanas.append(v)
-    
     cercanas.sort(key=lambda x: x['distancia_km'])
     return {'success': True, 'vigilancias': cercanas, 'total': len(cercanas)}
 
@@ -1271,71 +983,461 @@ async def vigilancias_activas(latitud: float, longitud: float):
 
 @app.post("/usuario/reportar")
 async def reportar_usuario(req: ReporteUsuario):
-    """
-    Reportar un usuario. Si acumula 3+ reportes, se bloquea automáticamente.
-    """
     pool = await get_pool()
     cs_reporta, cc_reporta = normalizar_celular(req.celular_reporta)
     cs_reportado, cc_reportado = normalizar_celular(req.celular_reportado)
-    
     async with pool.acquire() as conn:
-        # Verificar que no se reporte a sí mismo
         if cc_reporta == cc_reportado:
-            raise HTTPException(400, "Cannot report yourself")
-        
-        # Verificar que no haya reportado antes
+            raise HTTPException(400, "No puede reportarse a sí mismo")
         existe = await conn.fetchval(
-            "SELECT id FROM reportes_usuario WHERE celular_reportado=$1 AND celular_reporta=$2",
-            cc_reportado, cc_reporta)
+            "SELECT id FROM reportes_usuario WHERE celular_reportado=$1 AND celular_reporta=$2", cc_reportado, cc_reporta)
         if existe:
-            raise HTTPException(409, "Already reported this user")
-        
-        # Registrar reporte
+            raise HTTPException(409, "Ya reportó a este usuario")
         await conn.execute("""
             INSERT INTO reportes_usuario (celular_reportado, celular_reporta, motivo, descripcion)
             VALUES ($1, $2, $3, $4)
         """, cc_reportado, cc_reporta, req.motivo, req.descripcion)
-        
-        # Contar reportes totales
-        total_reportes = await conn.fetchval(
-            "SELECT COUNT(*) FROM reportes_usuario WHERE celular_reportado=$1",
-            cc_reportado)
-        
-        log.info(f"⚠️ Reporte: {cc_reporta} → {cc_reportado} ({req.motivo}). Total: {total_reportes}")
-        
-        # Auto-bloqueo si 3+ reportes
+        total_reportes = await conn.fetchval("SELECT COUNT(*) FROM reportes_usuario WHERE celular_reportado=$1", cc_reportado)
         bloqueado = False
         if total_reportes >= 3:
             await conn.execute("""
                 UPDATE usuarios_sos SET bloqueado=TRUE, motivo_bloqueo=$1, fecha_bloqueo=NOW()
                 WHERE celular IN ($2, $3)
             """, f"auto_block_{total_reportes}_reports", cs_reportado, cc_reportado)
-            
-            # También desactivar de la red
-            await conn.execute(
-                "UPDATE ubicaciones_red SET disponible=FALSE WHERE celular=$1", cc_reportado)
-            
+            await conn.execute("UPDATE ubicaciones_red SET disponible=FALSE WHERE celular=$1", cc_reportado)
             bloqueado = True
             log.warning(f"🚫 AUTO-BLOQUEO: {cc_reportado} con {total_reportes} reportes")
-    
-    return {
-        'success': True,
-        'total_reportes': total_reportes,
-        'usuario_bloqueado': bloqueado,
-        'mensaje': 'User blocked automatically' if bloqueado else 'Report registered',
-    }
+    return {'success': True, 'total_reportes': total_reportes, 'usuario_bloqueado': bloqueado}
 
 @app.get("/usuario/{celular}/reportes")
 async def ver_reportes(celular: str):
-    """Ver cuántos reportes tiene un usuario (solo conteo, no detalle)."""
     pool = await get_pool()
     cs, cc = normalizar_celular(celular)
     async with pool.acquire() as conn:
-        total = await conn.fetchval(
-            "SELECT COUNT(*) FROM reportes_usuario WHERE celular_reportado IN ($1,$2)", cs, cc)
-        bloqueado = await conn.fetchval(
-            "SELECT bloqueado FROM usuarios_sos WHERE celular IN ($1,$2)", cs, cc)
+        total = await conn.fetchval("SELECT COUNT(*) FROM reportes_usuario WHERE celular_reportado IN ($1,$2)", cs, cc)
+        bloqueado = await conn.fetchval("SELECT bloqueado FROM usuarios_sos WHERE celular IN ($1,$2)", cs, cc)
     return {'success': True, 'total_reportes': total, 'bloqueado': bloqueado or False}
+
+# ================================================================
+# PANEL ADMINISTRATIVO — MIGRACIÓN DE TABLAS
+# ================================================================
+
+async def migrar_tablas_panel():
+    """Crea las tablas del panel administrativo si no existen."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios_panel (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(100) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                nombre VARCHAR(100) NOT NULL,
+                rol VARCHAR(20) NOT NULL DEFAULT 'cuidador',
+                tipo_institucional VARCHAR(30),
+                celular VARCHAR(20),
+                activo BOOLEAN DEFAULT TRUE,
+                ultimo_login TIMESTAMP,
+                creado_en TIMESTAMP DEFAULT NOW(),
+                actualizado_en TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sesiones_panel (
+                id SERIAL PRIMARY KEY,
+                usuario_id INTEGER REFERENCES usuarios_panel(id) ON DELETE CASCADE,
+                token VARCHAR(255) UNIQUE NOT NULL,
+                ip_address VARCHAR(45),
+                user_agent TEXT,
+                expira_en TIMESTAMP NOT NULL,
+                creado_en TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS auditoria_panel (
+                id SERIAL PRIMARY KEY,
+                usuario_id INTEGER REFERENCES usuarios_panel(id),
+                accion VARCHAR(50) NOT NULL,
+                detalle TEXT,
+                ip_address VARCHAR(45),
+                creado_en TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        
+        indices = [
+            ("idx_alertas_panico_fecha", "alertas_panico", "fecha_hora DESC"),
+            ("idx_alertas_panico_atendida", "alertas_panico", "atendida"),
+            ("idx_alertas_panico_tipo", "alertas_panico", "tipo_alerta"),
+            ("idx_alertas_panico_nivel", "alertas_panico", "nivel_emergencia"),
+            ("idx_sesiones_token", "sesiones_panel", "token"),
+            ("idx_auditoria_fecha", "auditoria_panel", "creado_en DESC"),
+        ]
+        for nombre, tabla, columnas in indices:
+            try:
+                await conn.execute(f"CREATE INDEX IF NOT EXISTS {nombre} ON {tabla}({columnas})")
+            except Exception as e:
+                log.warning(f"  ⚠️ Índice {nombre}: {e}")
+        
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_ubicaciones_red_actualizado ON ubicaciones_red(actualizado_at)")
+        except Exception:
+            pass
+        
+        log.info("🟢 Migración panel administrativo completa")
+
+# ================================================================
+# PANEL ADMINISTRATIVO — HELPERS DE AUTH
+# ================================================================
+
+async def _verificar_token_panel(request: Request) -> dict:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "Token requerido")
+    token = auth[7:]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT s.usuario_id, s.expira_en, u.nombre, u.rol, u.tipo_institucional, u.email, u.activo
+            FROM sesiones_panel s JOIN usuarios_panel u ON u.id = s.usuario_id
+            WHERE s.token = $1
+        """, token)
+    if not row:
+        raise HTTPException(401, "Token inválido")
+    if row['expira_en'] < datetime.now():
+        raise HTTPException(401, "Token expirado")
+    if not row['activo']:
+        raise HTTPException(403, "Usuario desactivado")
+    return {
+        "usuario_id": row['usuario_id'], "nombre": row['nombre'],
+        "rol": row['rol'], "tipo_institucional": row['tipo_institucional'], "email": row['email'],
+    }
+
+async def _auditar(usuario_id: int, accion: str, detalle: str = None, ip: str = None):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO auditoria_panel (usuario_id, accion, detalle, ip_address)
+            VALUES ($1, $2, $3, $4)
+        """, usuario_id, accion, detalle, ip)
+
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def _verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed.encode())
+
+# ================================================================
+# PANEL ADMINISTRATIVO — AUTH ENDPOINTS
+# ================================================================
+
+@app.post("/panel/setup")
+async def panel_setup(req: CrearUsuarioPanel):
+    """Crear primer admin. Solo funciona si NO hay admins."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchval("SELECT COUNT(*) FROM usuarios_panel WHERE rol = 'admin'")
+        if existing > 0:
+            raise HTTPException(403, "Ya existe un admin. Usa /panel/login")
+        new_id = await conn.fetchval("""
+            INSERT INTO usuarios_panel (email, password_hash, nombre, rol)
+            VALUES ($1, $2, $3, 'admin') RETURNING id
+        """, req.email.lower().strip(), _hash_password(req.password), req.nombre)
+    return {"success": True, "mensaje": "Admin creado. Ahora usa /panel/login", "usuario_id": new_id}
+
+@app.post("/panel/login")
+async def panel_login(req: LoginPanel, request: Request):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("""
+            SELECT id, email, password_hash, nombre, rol, tipo_institucional, activo
+            FROM usuarios_panel WHERE email = $1
+        """, req.email.lower().strip())
+    if not user:
+        raise HTTPException(401, "Credenciales inválidas")
+    if not user['activo']:
+        raise HTTPException(403, "Usuario desactivado")
+    if not _verify_password(req.password, user['password_hash']):
+        raise HTTPException(401, "Credenciales inválidas")
+    
+    token = secrets.token_urlsafe(48)
+    expira = datetime.now() + timedelta(hours=12)
+    ip = request.client.host if request.client else None
+    
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sesiones_panel (usuario_id, token, ip_address, user_agent, expira_en)
+            VALUES ($1, $2, $3, $4, $5)
+        """, user['id'], token, ip, request.headers.get("User-Agent", ""), expira)
+        await conn.execute("UPDATE usuarios_panel SET ultimo_login = NOW() WHERE id = $1", user['id'])
+    
+    await _auditar(user['id'], "login", f"IP: {ip}", ip)
+    return {
+        "success": True, "token": token, "expira_en": expira.isoformat(),
+        "usuario": {"id": user['id'], "nombre": user['nombre'], "email": user['email'],
+                     "rol": user['rol'], "tipo_institucional": user['tipo_institucional']},
+    }
+
+@app.post("/panel/logout")
+async def panel_logout(request: Request):
+    user = await _verificar_token_panel(request)
+    token = request.headers.get("Authorization", "")[7:]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM sesiones_panel WHERE token = $1", token)
+    await _auditar(user['usuario_id'], "logout")
+    return {"success": True}
+
+@app.get("/panel/me")
+async def panel_me(request: Request):
+    user = await _verificar_token_panel(request)
+    return {"success": True, "usuario": user}
+
+# ================================================================
+# PANEL — ALERTAS
+# ================================================================
+
+@app.get("/panel/alertas")
+async def panel_alertas(
+    request: Request, page: int = 1, limit: int = 50,
+    estado: Optional[str] = None, tipo: Optional[str] = None,
+    nivel: Optional[int] = None, desde: Optional[str] = None, hasta: Optional[str] = None,
+):
+    user = await _verificar_token_panel(request)
+    conditions = []
+    params = []
+    param_idx = 1
+    
+    if user['rol'] in ('policia', 'ambulancia', 'bomberos'):
+        tipo_map = {'policia': ['seguridad', 'violencia'], 'ambulancia': ['salud', 'caida'], 'bomberos': ['incendio']}
+        tipos = tipo_map.get(user['rol'], [])
+        if tipos:
+            placeholders = ', '.join(f'${param_idx + i}' for i in range(len(tipos)))
+            conditions.append(f"tipo_alerta IN ({placeholders})")
+            params.extend(tipos)
+            param_idx += len(tipos)
+    
+    if estado == 'atendida':
+        conditions.append(f"atendida = ${param_idx}"); params.append('si'); param_idx += 1
+    elif estado == 'no_atendida':
+        conditions.append(f"atendida = ${param_idx}"); params.append('no'); param_idx += 1
+    if tipo:
+        conditions.append(f"tipo_alerta = ${param_idx}"); params.append(tipo); param_idx += 1
+    if nivel:
+        conditions.append(f"nivel_emergencia = ${param_idx}"); params.append(nivel); param_idx += 1
+    if desde:
+        conditions.append(f"fecha_hora >= ${param_idx}"); params.append(desde); param_idx += 1
+    if hasta:
+        conditions.append(f"fecha_hora <= ${param_idx}"); params.append(hasta); param_idx += 1
+    
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    offset = (page - 1) * limit
+    
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM alertas_panico {where}", *params)
+        rows = await conn.fetch(f"""
+            SELECT id, nombre, mensaje, fecha_hora, celular, atendida, 
+                   tipo_alerta, latitud, longitud, nivel_alerta, nivel_emergencia,
+                   fuente_alerta, receptor_destino
+            FROM alertas_panico {where} ORDER BY fecha_hora DESC LIMIT {limit} OFFSET {offset}
+        """, *params)
+    
+    await _auditar(user['usuario_id'], "ver_alertas", f"page={page}")
+    return {
+        "success": True, "alertas": [row_to_dict(r) for r in rows],
+        "total": total, "page": page, "pages": (total + limit - 1) // limit if total > 0 else 0,
+    }
+
+@app.get("/panel/alertas/{alerta_id}")
+async def panel_alerta_detalle(alerta_id: int, request: Request):
+    user = await _verificar_token_panel(request)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        alerta = await conn.fetchrow("SELECT * FROM alertas_panico WHERE id = $1", alerta_id)
+    if not alerta:
+        raise HTTPException(404, "Alerta no encontrada")
+    await _auditar(user['usuario_id'], "ver_alerta_detalle", f"alerta_id={alerta_id}")
+    return {"success": True, "alerta": row_to_dict(alerta)}
+
+@app.post("/panel/alertas/{alerta_id}/atender")
+async def panel_atender_alerta(alerta_id: int, request: Request):
+    user = await _verificar_token_panel(request)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE alertas_panico SET atendida = 'si' WHERE id = $1", alerta_id)
+    await _auditar(user['usuario_id'], "atender_alerta", f"alerta_id={alerta_id}")
+    return {"success": True, "mensaje": f"Alerta {alerta_id} marcada como atendida"}
+
+# ================================================================
+# PANEL — MAPA EN TIEMPO REAL
+# ================================================================
+
+@app.get("/panel/mapa/alertas-activas")
+async def panel_mapa_alertas_activas(request: Request):
+    user = await _verificar_token_panel(request)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, nombre, tipo_alerta, nivel_emergencia, nivel_alerta,
+                   latitud, longitud, fecha_hora, celular, fuente_alerta
+            FROM alertas_panico
+            WHERE atendida = 'no' AND latitud IS NOT NULL AND longitud IS NOT NULL
+              AND fecha_hora >= NOW() - INTERVAL '24 hours'
+            ORDER BY fecha_hora DESC
+        """)
+    return {"success": True, "alertas": [row_to_dict(r) for r in rows]}
+
+@app.get("/panel/mapa/red-comunitaria")
+async def panel_mapa_red(request: Request):
+    user = await _verificar_token_panel(request)
+    if user['rol'] != 'admin':
+        raise HTTPException(403, "Solo admin puede ver la red comunitaria")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT celular, latitud, longitud, disponible, actualizado_at
+            FROM ubicaciones_red
+            WHERE actualizado_at >= NOW() - INTERVAL '1 hour' AND latitud IS NOT NULL
+        """)
+    return {"success": True, "miembros": [row_to_dict(r) for r in rows], "total": len(rows)}
+
+# ================================================================
+# PANEL — DASHBOARD
+# ================================================================
+
+@app.get("/panel/dashboard")
+async def panel_dashboard(request: Request):
+    user = await _verificar_token_panel(request)
+    if user['rol'] != 'admin':
+        raise HTTPException(403, "Solo admin")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total_alertas = await conn.fetchval("SELECT COUNT(*) FROM alertas_panico")
+        alertas_hoy = await conn.fetchval("SELECT COUNT(*) FROM alertas_panico WHERE fecha_hora >= CURRENT_DATE")
+        no_atendidas = await conn.fetchval("SELECT COUNT(*) FROM alertas_panico WHERE atendida = 'no'")
+        por_tipo = await conn.fetch("SELECT tipo_alerta, COUNT(*) as total FROM alertas_panico GROUP BY tipo_alerta ORDER BY total DESC")
+        por_nivel = await conn.fetch("SELECT nivel_emergencia, COUNT(*) as total FROM alertas_panico GROUP BY nivel_emergencia ORDER BY nivel_emergencia")
+        por_dia = await conn.fetch("""
+            SELECT DATE(fecha_hora) as dia, COUNT(*) as total FROM alertas_panico
+            WHERE fecha_hora >= CURRENT_DATE - INTERVAL '7 days' GROUP BY DATE(fecha_hora) ORDER BY dia
+        """)
+        por_fuente = await conn.fetch("SELECT fuente_alerta, COUNT(*) as total FROM alertas_panico GROUP BY fuente_alerta ORDER BY total DESC")
+        red_activa = await conn.fetchval("SELECT COUNT(*) FROM ubicaciones_red WHERE actualizado_at >= NOW() - INTERVAL '30 minutes'") or 0
+    
+    await _auditar(user['usuario_id'], "ver_dashboard")
+    return {
+        "success": True,
+        "stats": {
+            "total_alertas": total_alertas, "alertas_hoy": alertas_hoy,
+            "no_atendidas": no_atendidas, "red_activa": red_activa,
+            "por_tipo": [dict(r) for r in por_tipo],
+            "por_nivel": [dict(r) for r in por_nivel],
+            "por_dia": [{"dia": str(r['dia']), "total": r['total']} for r in por_dia],
+            "por_fuente": [dict(r) for r in por_fuente],
+        }
+    }
+
+# ================================================================
+# PANEL — GESTIÓN DE USUARIOS
+# ================================================================
+
+@app.get("/panel/usuarios")
+async def panel_usuarios_lista(request: Request):
+    user = await _verificar_token_panel(request)
+    if user['rol'] != 'admin':
+        raise HTTPException(403, "Solo admin")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, email, nombre, rol, tipo_institucional, celular, activo, ultimo_login, creado_en
+            FROM usuarios_panel ORDER BY creado_en DESC
+        """)
+    return {"success": True, "usuarios": [row_to_dict(r) for r in rows]}
+
+@app.post("/panel/usuarios")
+async def panel_crear_usuario(req: CrearUsuarioPanel, request: Request):
+    user = await _verificar_token_panel(request)
+    if user['rol'] != 'admin':
+        raise HTTPException(403, "Solo admin")
+    roles_validos = ['admin', 'policia', 'ambulancia', 'bomberos', 'cuidador']
+    if req.rol not in roles_validos:
+        raise HTTPException(400, f"Rol inválido. Opciones: {roles_validos}")
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            new_id = await conn.fetchval("""
+                INSERT INTO usuarios_panel (email, password_hash, nombre, rol, tipo_institucional, celular)
+                VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+            """, req.email.lower().strip(), _hash_password(req.password), req.nombre,
+                req.rol, req.tipo_institucional, req.celular)
+    except Exception as e:
+        if "unique" in str(e).lower():
+            raise HTTPException(409, "Email ya registrado")
+        raise
+    await _auditar(user['usuario_id'], "crear_usuario", f"nuevo_id={new_id} rol={req.rol}")
+    return {"success": True, "usuario_id": new_id}
+
+@app.put("/panel/usuarios/{uid}/toggle")
+async def panel_toggle_usuario(uid: int, request: Request):
+    user = await _verificar_token_panel(request)
+    if user['rol'] != 'admin':
+        raise HTTPException(403, "Solo admin")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        nuevo = await conn.fetchval("UPDATE usuarios_panel SET activo = NOT activo, actualizado_en = NOW() WHERE id = $1 RETURNING activo", uid)
+    if nuevo is None:
+        raise HTTPException(404, "Usuario no encontrado")
+    await _auditar(user['usuario_id'], "toggle_usuario", f"uid={uid} activo={nuevo}")
+    return {"success": True, "activo": nuevo}
+
+# ================================================================
+# PANEL — EVIDENCIAS (proxy Firebase Storage)
+# ================================================================
+
+@app.get("/panel/evidencias/{alerta_id}")
+async def panel_evidencias(alerta_id: int, request: Request):
+    user = await _verificar_token_panel(request)
+    await _auditar(user['usuario_id'], "ver_evidencia", f"alerta_id={alerta_id}")
+    try:
+        from firebase_admin import storage
+        bucket = storage.bucket()
+        blobs = list(bucket.list_blobs(prefix=f"alertas/{alerta_id}/"))
+        evidencias = []
+        for blob in blobs:
+            url = blob.generate_signed_url(expiration=timedelta(hours=1))
+            evidencias.append({
+                "nombre": blob.name.split("/")[-1], "url": url,
+                "tipo": "imagen" if blob.content_type and "image" in blob.content_type else "otro",
+                "tamano": blob.size,
+                "subido_en": blob.time_created.isoformat() if blob.time_created else None,
+            })
+        return {"success": True, "evidencias": evidencias, "total": len(evidencias)}
+    except Exception as e:
+        log.warning(f"Error accediendo evidencias: {e}")
+        return {"success": True, "evidencias": [], "total": 0, "nota": "Firebase Storage no configurado o sin evidencias"}
+
+# ================================================================
+# PANEL — AUDITORÍA
+# ================================================================
+
+@app.get("/panel/auditoria")
+async def panel_auditoria(request: Request, page: int = 1, limit: int = 50):
+    user = await _verificar_token_panel(request)
+    if user['rol'] != 'admin':
+        raise HTTPException(403, "Solo admin")
+    offset = (page - 1) * limit
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM auditoria_panel")
+        rows = await conn.fetch(f"""
+            SELECT a.id, a.accion, a.detalle, a.ip_address, a.creado_en, u.nombre, u.email, u.rol
+            FROM auditoria_panel a
+            LEFT JOIN usuarios_panel u ON u.id = a.usuario_id
+            ORDER BY a.creado_en DESC LIMIT {limit} OFFSET {offset}
+        """)
+    return {
+        "success": True, "registros": [row_to_dict(r) for r in rows],
+        "total": total, "page": page, "pages": (total + limit - 1) // limit if total > 0 else 0,
+    }
 
 # ==================== HEALTH ====================
 
@@ -1345,13 +1447,21 @@ async def health():
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        return {"status": "ok", "db": "postgresql", "version": "3.0.0", "timestamp": datetime.now().isoformat()}
+        return {"status": "ok", "db": "postgresql", "version": "3.1.0", "timestamp": datetime.now().isoformat()}
     except:
         return {"status": "degraded", "db": "disconnected"}
 
 @app.get("/")
 async def root():
-    return {"app": "🆘 Ami SOS", "version": "3.0.0", "features": [
+    return {"app": "🆘 Ami SOS", "version": "3.1.0", "features": [
         "3 alert levels", "community network", "BLE relay",
-        "auto-block after 3 reports", "multi-country support"
-    ], "docs": "/docs"}
+        "admin panel", "role-based access", "audit trail"
+    ], "docs": "/docs", "panel": "/panel-app/"}
+
+# ==================== SERVIR PANEL WEB ====================
+
+try:
+    app.mount("/panel-app", StaticFiles(directory="panel", html=True), name="panel")
+    log.info("✅ Panel web montado en /panel-app/")
+except Exception:
+    log.warning("⚠️ Carpeta 'panel/' no encontrada. Panel web no disponible.")
