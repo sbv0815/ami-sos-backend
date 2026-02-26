@@ -55,6 +55,216 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger("amisos")
 
+# ==================== MOTOR DE DECISIÓN ====================
+
+PROTOCOLOS_EMERGENCIA = {
+    "robo_hurto": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "🚨 {nombre} reporta un robo cerca de su ubicación. La policía fue notificada.",
+            "comunidad": "⚠️ Robo reportado a {distancia}. SÉ TESTIGO desde distancia segura. NO intervengas. Graba video si es seguro.",
+            "policia": "🚨 ROBO en curso — {ubicacion}. Víctima: {nombre}. {descripcion_ia}",
+        },
+        "nivel_minimo": 2, "llamar_123": True, "llamar_155": False, "escalar_min": 3,
+        "instrucciones": "Mantén distancia. Graba como evidencia. NO persigas.",
+    },
+    "robo_armado": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": True, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "🔴 EMERGENCIA CRÍTICA: {nombre} en situación de robo armado. Policía notificada. NO contactes directamente.",
+            "comunidad": "🔴 PELIGRO: Robo ARMADO a {distancia}. ALÉJATE inmediatamente. NO te acerques. Policía en camino.",
+            "policia": "🔴 URGENTE — ROBO ARMADO en {ubicacion}. Arma confirmada. Víctima: {nombre}. {descripcion_ia}",
+            "ambulancia": "⚠️ Alerta preventiva: Robo armado en {ubicacion}. Posibles heridos.",
+        },
+        "nivel_minimo": 3, "llamar_123": True, "llamar_155": False, "escalar_min": 1,
+        "instrucciones": "ALÉJATE. NO intentes ser héroe. Graba solo desde lejos.",
+    },
+    "persona_sospechosa": {
+        "circulos": {"cuidadores": False, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": False},
+        "mensajes": {
+            "comunidad": "👁️ ALERTA PREVENTIVA a {distancia}: Actividad sospechosa reportada. Mantente alerta. NO confrontes.",
+            "policia": "👁️ PREVENTIVO — Actividad sospechosa en {ubicacion}. {descripcion_ia}. Verificar.",
+        },
+        "nivel_minimo": 1, "llamar_123": False, "llamar_155": False, "escalar_min": 10, "es_preventiva": True,
+        "instrucciones": "Observa y reporta. NO te acerques. Envía fotos si puedes.",
+    },
+    "vehiculo_sospechoso": {
+        "circulos": {"cuidadores": False, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": False},
+        "mensajes": {
+            "comunidad": "👁️ PREVENTIVA a {distancia}: Vehículo sospechoso. Anota placa y descripción desde lejos. NO te acerques.",
+            "policia": "👁️ PREVENTIVO — Vehículo sospechoso en {ubicacion}. {descripcion_ia}.",
+        },
+        "nivel_minimo": 1, "llamar_123": False, "llamar_155": False, "escalar_min": 15, "es_preventiva": True,
+        "instrucciones": "Anota placa desde lejos. NO bloquees vía. Reporta movimientos.",
+    },
+    "agresion_fisica": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": True, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "🔴 {nombre} reporta agresión física. Policía y ambulancia notificados.",
+            "comunidad": "🔴 Agresión física a {distancia}. Llama al 123. NO intervengas físicamente. Tu presencia como testigo ayuda.",
+            "policia": "🔴 AGRESIÓN FÍSICA en {ubicacion}. Víctima: {nombre}. {descripcion_ia}",
+            "ambulancia": "🟠 Posibles heridos por agresión en {ubicacion}.",
+        },
+        "nivel_minimo": 3, "llamar_123": True, "llamar_155": True, "escalar_min": 2,
+        "instrucciones": "Sé testigo. Graba desde distancia. NO intervengas físicamente.",
+    },
+    "violencia_intrafamiliar": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "🟣 URGENTE: {nombre} activó alerta de violencia intrafamiliar. Necesita ayuda AHORA. Policía notificada.",
+            "comunidad": "🟣 URGENTE: {nombre} necesita ayuda inmediata. Acércate, toca la puerta, haz presencia. Policía en camino pero TÚ estás más cerca.",
+            "policia": "🟣 VIOLENCIA INTRAFAMILIAR — {ubicacion}. Víctima: {nombre}. Protocolo VIF. Línea 155 notificada.",
+        },
+        "nivel_minimo": 3, "llamar_123": True, "llamar_155": True, "escalar_min": 1,
+        "comunidad_solo_preautorizados": True,
+        "instrucciones": "Haz presencia visible. Toca la puerta. NO entres a la vivienda. Graba audio.",
+    },
+    "emergencia_medica": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": False, "ambulancia": True, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "🚑 {nombre} tiene emergencia médica. Ambulancia notificada.",
+            "comunidad": "🚑 Emergencia médica a {distancia}. ¿Sabes primeros auxilios? Tu ayuda puede salvar una vida.",
+            "ambulancia": "🚑 EMERGENCIA MÉDICA en {ubicacion}. {descripcion_ia}",
+        },
+        "nivel_minimo": 2, "llamar_123": True, "llamar_155": False, "escalar_min": 2,
+        "instrucciones": "Primeros auxilios si sabes. Despeja el área. Guía a la ambulancia.",
+    },
+    "persona_herida": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": False, "ambulancia": True, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "🩸 {nombre} está herido/a. Ambulancia en camino.",
+            "comunidad": "🩸 Persona herida a {distancia}. Primeros auxilios si puedes. Ambulancia notificada.",
+            "ambulancia": "🩸 PERSONA HERIDA en {ubicacion}. {descripcion_ia}",
+        },
+        "nivel_minimo": 2, "llamar_123": True, "llamar_155": False, "escalar_min": 2,
+        "instrucciones": "No mover si hay trauma. Despejar área para ambulancia.",
+    },
+    "caida_persona": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": False, "ambulancia": False, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "⚠️ {nombre} ha sufrido una caída. Verifica su estado.",
+            "comunidad": "🤝 Persona necesita ayuda cerca ({distancia}). Ha sufrido una caída. Acércate si puedes.",
+        },
+        "nivel_minimo": 1, "llamar_123": False, "llamar_155": False, "escalar_min": 5,
+        "instrucciones": "Ayuda a levantarse si no hay lesión. Si hay lesión, NO mover y llama 123.",
+    },
+    "adulto_perdido": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "📍 {nombre} parece estar desorientado/a. Ubicación compartida.",
+            "comunidad": "🔍 Adulto mayor desorientado cerca ({distancia}). Acércate amablemente. Nombre: {nombre}.",
+            "policia": "🔍 Adulto mayor desorientado en {ubicacion}. Nombre: {nombre}. Apoyo en ubicación.",
+        },
+        "nivel_minimo": 1, "llamar_123": False, "llamar_155": False, "escalar_min": 10,
+        "instrucciones": "Acércate amable y tranquilo. Ayúdalo a contactar familia.",
+    },
+    "accidente_transito": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": True, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "🚗 {nombre} reporta accidente de tránsito. Autoridades notificadas.",
+            "comunidad": "🚗 Accidente de tránsito a {distancia}. Señaliza la vía. Asiste heridos SIN moverlos.",
+            "policia": "🚗 ACCIDENTE DE TRÁNSITO en {ubicacion}. {descripcion_ia}",
+            "ambulancia": "🚗 Accidente en {ubicacion}. Posibles heridos. {descripcion_ia}",
+        },
+        "nivel_minimo": 2, "llamar_123": True, "llamar_155": False, "escalar_min": 3,
+        "instrucciones": "Señaliza vía. Asiste heridos SIN moverlos. NO muevas vehículos.",
+    },
+    "incendio": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": True, "bomberos": True},
+        "mensajes": {
+            "cuidadores": "🔥 {nombre} reporta incendio. Bomberos notificados.",
+            "comunidad": "🔥 INCENDIO a {distancia}. EVACÚA la zona. NO intentes apagar. Ayuda a personas a salir.",
+            "policia": "🔥 INCENDIO en {ubicacion}. Bomberos notificados. Apoyo en evacuación.",
+            "ambulancia": "🔥 Incendio en {ubicacion}. Posibles heridos.",
+            "bomberos": "🔥 INCENDIO en {ubicacion}. {descripcion_ia}",
+        },
+        "nivel_minimo": 3, "llamar_123": True, "llamar_155": False, "escalar_min": 1,
+        "instrucciones": "EVACÚA. Ayuda a mayores y niños. NO entres con humo.",
+    },
+    "inundacion": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": True},
+        "mensajes": {
+            "cuidadores": "🌊 {nombre} reporta inundación. Mantente comunicado.",
+            "comunidad": "🌊 Inundación a {distancia}. Muévete a zonas altas. NO camines por agua en movimiento.",
+            "policia": "🌊 Inundación en {ubicacion}. Posible evacuación.",
+            "bomberos": "🌊 INUNDACIÓN en {ubicacion}. {descripcion_ia}. Posibles atrapados.",
+        },
+        "nivel_minimo": 2, "llamar_123": True, "llamar_155": False, "escalar_min": 2,
+        "instrucciones": "Zonas altas. NO camines por agua. Ayuda a vecinos mayores.",
+    },
+    "situacion_riesgo": {
+        "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": False},
+        "mensajes": {
+            "cuidadores": "⚠️ {nombre} reporta situación de riesgo. Autoridades notificadas.",
+            "comunidad": "⚠️ Situación de riesgo a {distancia}. Mantente alerta. Reporta novedades.",
+            "policia": "⚠️ Situación de riesgo en {ubicacion}. {descripcion_ia}. Verificar.",
+        },
+        "nivel_minimo": 1, "llamar_123": False, "llamar_155": False, "escalar_min": 5,
+        "instrucciones": "Mantente alerta a distancia. Reporta novedades.",
+    },
+    "dano_propiedad": {
+        "circulos": {"cuidadores": False, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": False},
+        "mensajes": {
+            "comunidad": "⚠️ Daño a propiedad a {distancia}. Sirve como testigo si viste algo.",
+            "policia": "⚠️ Daño a propiedad en {ubicacion}. {descripcion_ia}.",
+        },
+        "nivel_minimo": 1, "llamar_123": False, "llamar_155": False, "escalar_min": 15,
+        "instrucciones": "Toma fotos. Colabora como testigo.",
+    },
+    "no_emergencia": {
+        "circulos": {"cuidadores": True, "comunidad": False, "policia": False, "ambulancia": False, "bomberos": False},
+        "mensajes": {"cuidadores": "ℹ️ {nombre} activó alerta pero no se detectó emergencia. Verifica su estado."},
+        "nivel_minimo": 1, "llamar_123": False, "llamar_155": False, "escalar_min": 30,
+        "instrucciones": "",
+    },
+    "imagen_no_clara": {
+        "circulos": {"cuidadores": True, "comunidad": False, "policia": False, "ambulancia": False, "bomberos": False},
+        "mensajes": {"cuidadores": "⚠️ {nombre} envió alerta pero la evidencia no es clara. Comunícate para verificar."},
+        "nivel_minimo": 1, "llamar_123": False, "llamar_155": False, "escalar_min": 5,
+        "instrucciones": "",
+    },
+}
+
+PROTOCOLO_DEFAULT = {
+    "circulos": {"cuidadores": True, "comunidad": True, "policia": True, "ambulancia": False, "bomberos": False},
+    "mensajes": {
+        "cuidadores": "🚨 {nombre} necesita ayuda. Autoridades notificadas.",
+        "comunidad": "🚨 Emergencia a {distancia}. Mantente alerta. Acércate solo si es seguro.",
+        "policia": "🚨 Emergencia en {ubicacion}. {descripcion_ia}",
+    },
+    "nivel_minimo": 2, "llamar_123": True, "llamar_155": False, "escalar_min": 3,
+    "instrucciones": "Evalúa antes de acercarte. Reporta novedades.",
+}
+
+
+def obtener_protocolo(clasificacion: str, tiene_arma: bool = False, hay_heridos: bool = False) -> dict:
+    """Retorna protocolo de respuesta. Ajusta automáticamente si hay armas o heridos."""
+    proto = PROTOCOLOS_EMERGENCIA.get(clasificacion, PROTOCOLO_DEFAULT).copy()
+    proto["circulos"] = dict(proto["circulos"])
+    if tiene_arma and clasificacion == "robo_hurto":
+        proto = PROTOCOLOS_EMERGENCIA["robo_armado"].copy()
+        proto["circulos"] = dict(proto["circulos"])
+    if tiene_arma:
+        proto["circulos"]["policia"] = True
+        proto["nivel_minimo"] = 3
+        proto["escalar_min"] = 1
+    if hay_heridos:
+        proto["circulos"]["ambulancia"] = True
+        if proto["nivel_minimo"] < 2:
+            proto["nivel_minimo"] = 2
+    return proto
+
+
+def generar_mensajes_protocolo(protocolo: dict, nombre: str, ubicacion: str, distancia: str = "", descripcion_ia: str = "") -> dict:
+    """Genera mensajes finales reemplazando variables."""
+    mensajes = {}
+    for dest, plantilla in protocolo.get("mensajes", {}).items():
+        mensajes[dest] = plantilla.format(
+            nombre=nombre, ubicacion=ubicacion,
+            distancia=distancia or "cercana", descripcion_ia=descripcion_ia or "")
+    return mensajes
+
+
 # ==================== POSTGRESQL ====================
 
 async def get_pool():
