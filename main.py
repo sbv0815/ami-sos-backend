@@ -2426,6 +2426,53 @@ async def panel_revisar_analisis(analisis_id: int, req: RevisionAnalisis, reques
     }
 
 
+# ==================== DEBUG (temporal) ====================
+
+@app.get("/debug/alerta/{alerta_id}")
+async def debug_alerta(alerta_id: int):
+    """Diagnóstico completo de una alerta — TEMPORAL, quitar en producción."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        alerta = await conn.fetchrow("SELECT * FROM alertas_panico WHERE id=$1", alerta_id)
+        if not alerta:
+            return {"error": "Alerta no encontrada"}
+        
+        cel = alerta['celular']
+        cs, cc = normalizar_celular(cel)
+        
+        # Cuidadores registrados
+        cuidadores = await conn.fetch("""
+            SELECT cc.celular, cc.nombre FROM contactos_confianza cc
+            INNER JOIN usuarios_sos u ON u.id = cc.usuario_id
+            WHERE u.celular IN ($1,$2) AND cc.activo=TRUE
+        """, cs, cc)
+        
+        cuidadores2 = await conn.fetch(
+            "SELECT celular_cuidador FROM cuidadores_autorizados WHERE celular_cuidado IN ($1,$2)", cs, cc)
+        
+        # Tokens FCM
+        token_usuario = await conn.fetchrow(
+            "SELECT token, valido, actualizado FROM tokens_fcm WHERE celular IN ($1,$2) ORDER BY actualizado DESC LIMIT 1", cs, cc)
+        
+        # Envíos realizados
+        envios = await conn.fetch(
+            "SELECT celular_cuidador_institucional, nombre_cuidador_institucional, estado_envio, rol_destinatario FROM alertas_enviadas WHERE alerta_id=$1", alerta_id)
+        
+        # Respuestas
+        respuestas = await conn.fetch(
+            "SELECT celular, nombre, entidad, estado FROM respuestas_institucionales WHERE alerta_id=$1", alerta_id)
+        
+        return {
+            "alerta": row_to_dict(alerta),
+            "celular_usuario": {"sin_prefijo": cs, "con_prefijo": cc},
+            "cuidadores_contactos_confianza": [dict(r) for r in cuidadores],
+            "cuidadores_autorizados": [dict(r) for r in cuidadores2],
+            "total_cuidadores": len(cuidadores) + len(cuidadores2),
+            "token_fcm_usuario": row_to_dict(token_usuario) if token_usuario else None,
+            "envios_realizados": [dict(r) for r in envios],
+            "respuestas": [dict(r) for r in respuestas],
+        }
+
 # ==================== HEALTH ====================
 
 @app.get("/health")
