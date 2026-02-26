@@ -707,6 +707,263 @@ async def relay_ble(req: RelayBLE, bg: BackgroundTasks):
         )
         
         return await recibir_alerta(alerta_req, bg)
+    
+# ==================== ENDPOINT UNIFICADO BLE ====================
+# Agregar este bloque al main.py de Ami SOS (FastAPI)
+# Va después del bloque de RELAY BLE y antes de CLASIFICAR CON CLAUDE
+# ==================================================================
+
+# --- Nuevo modelo ---
+
+class AlertaBLE(BaseModel):
+    """Alerta unificada desde botón Bluetooth (iTag) de cualquier plataforma."""
+    celular: str
+    plataforma: str = "ami_sos"          # "ami_sos" o "ami"
+    id_persona: Optional[int] = None
+    nombre: Optional[str] = None
+    nivel_emergencia: int = 2            # 1=leve, 2=grave, 3=crítica
+    tipo_alerta: str = "emergencia"
+    mensaje: Optional[str] = None
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+    fuente_alerta: str = "boton_ble"     # Siempre boton_ble desde iTag
+    bateria_dispositivo: Optional[int] = None
+    mac_dispositivo: Optional[str] = None  # MAC del iTag (para log/debug)
+
+# --- URL del backend Ami adultos (PHP/Hostinger) ---
+# Configura esto como variable de entorno en Render:
+#   AMI_ADULTOS_URL=https://tudominio.com/api/enviar_alerta_esp32.php
+#
+# O si tienes un endpoint más limpio:
+#   AMI_ADULTOS_URL=https://tudominio.com/api/alerta
+
+AMI_ADULTOS_URL = os.getenv('AMI_ADULTOS_URL', '')
+
+# --- Endpoint unificado ---
+
+@app.post("/ble/alerta")
+async def alerta_ble_unificada(req: AlertaBLE, bg: BackgroundTasks):
+    """
+    🔵 ENDPOINT UNIFICADO BLE
+    
+    Recibe alertas desde botón Bluetooth (iTag) de AMBAS plataformas:
+    
+    - plataforma="ami_sos" → Procesa internamente (3 niveles, red comunitaria)
+    - plataforma="ami"     → Forward al backend PHP de Ami adultos (cuidador/familia)
+    
+    Usado por:
+    - App Ami SOS (Flutter) → ble_foreground_service.dart / ble_button_service.dart
+    - App Ami adultos (Flutter) → mismo código BLE, diferente plataforma
+    """
+    inicio = time.time()
+    cel_sin, cel_con = normalizar_celular(req.celular)
+    plataforma = req.plataforma.lower().strip()
+    
+    log.info(f"🔵 BLE ALERTA [{plataforma.upper()}]: cel={cel_con} nivel={req.nivel_emergencia} mac={req.mac_dispositivo or 'N/A'}")
+    
+    # ============================================================
+    # RUTA 1: AMI SOS → Procesar internamente (3 niveles)
+    # ============================================================
+    if plataforma == "ami_sos":
+        log.info(f"  → Procesando en Ami SOS (interno)")
+        
+        # Convertir a AlertaRequest y delegar al endpoint principal
+        alerta_req = AlertaRequest(
+            celular=req.celular,
+            id_persona=req.id_persona,
+            nombre=req.nombre,
+            nivel_emergencia=req.nivel_emergencia,
+            tipo_alerta=req.tipo_alerta,
+            nivel_alerta="critica" if req.nivel_emergencia >= 2 else "leve",
+            mensaje=req.mensaje,
+            latitud=req.latitud,
+            longitud=req.longitud,
+            fuente_alerta="boton",  # Mapear a valor válido de la tabla
+            receptor_destino="cuidador",
+            bateria_dispositivo=req.bateria_dispositivo,
+        )
+        
+        # Reutilizar el endpoint /alerta existente
+        resultado = await recibir_alerta(alerta_req, bg)
+        
+        ms = round((time.time() - inicio) * 1000)
+        resultado['plataforma'] = 'ami_sos'
+        resultado['fuente'] = 'boton_ble'
+        resultado['tiempo_total_ms'] = ms
+        
+        return resultado
+    
+    # ============================================================
+    # RUTA 2: AMI ADULTOS → Forward al backend PHP (Hostinger)
+    # ============================================================
+    elif plataforma == "ami":
+        log.info(f"  → Reenviando a Ami adultos (PHP)")
+        
+        if not AMI_ADULTOS_URL:
+            log.error("  ❌ AMI_ADULTOS_URL no configurada")
+            raise HTTPException(
+                500, 
+                "Backend Ami adultos no configurado. "
+                "Configura AMI_ADULTOS_URL en las variables de entorno de Render."
+            )
+        
+        # Construir payload compatible con enviar_alerta_esp32.php
+        payload_php = {
+            "celular": cel_con,
+            "id_persona": req.id_persona,
+            "nombre": req.nombre or "",
+            "tipo_alerta": req.tipo_alerta,
+            "nivel_alerta": "critica" if req.nivel_emergencia >= 2 else "leve",
+            "mensaje": req.mensaje or "",
+            "latitud": req.latitud,
+            "longitud": req.longitud,
+            "fuente_alerta": "boton",       # PHP espera: boton, caida, manual, etc.
+            "receptor_destino": "cuidador",
+            "rol": "usuario",
+        }
+        
+        # Enviar al backend PHP
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    AMI_ADULTOS_URL,
+                    json=payload_php,
+                    timeout=15,
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                ms = round((time.time() - inicio) * 1000)
+                
+                if resp.status_code == 200:
+                    resultado_php = resp.json()
+                    log.info(f"  ✅ Ami adultos respondió OK: alerta_id={resultado_php.get('alerta_id')}")
+                    
+                    return {
+                        "success": True,
+                        "plataforma": "ami",
+                        "fuente": "boton_ble",
+                        "alerta_id": resultado_php.get("alerta_id"),
+                        "mensaje": "Alerta enviada a cuidadores de Ami",
+                        "notificados": resultado_php.get("notificados", 0),
+                        "total_cuidadores": resultado_php.get("total_cuidadores", 0),
+                        "backend_response": resultado_php,
+                        "tiempo_total_ms": ms,
+                    }
+                else:
+                    log.error(f"  ❌ Ami adultos HTTP {resp.status_code}: {resp.text[:200]}")
+                    
+                    # FALLBACK: Guardar localmente para no perder la alerta
+                    alerta_id_local = await _guardar_alerta_fallback(
+                        req, cel_con, "ami", f"forward_failed_http_{resp.status_code}"
+                    )
+                    
+                    return {
+                        "success": False,
+                        "plataforma": "ami",
+                        "fuente": "boton_ble",
+                        "error": f"Backend Ami adultos respondió HTTP {resp.status_code}",
+                        "fallback_alerta_id": alerta_id_local,
+                        "mensaje": "Alerta guardada localmente como respaldo. Se reintentará.",
+                        "tiempo_total_ms": ms,
+                    }
+                    
+        except httpx.TimeoutException:
+            log.error(f"  ❌ Timeout conectando a Ami adultos ({AMI_ADULTOS_URL})")
+            
+            alerta_id_local = await _guardar_alerta_fallback(
+                req, cel_con, "ami", "forward_timeout"
+            )
+            
+            return {
+                "success": False,
+                "plataforma": "ami",
+                "error": "Timeout conectando a backend Ami adultos",
+                "fallback_alerta_id": alerta_id_local,
+                "mensaje": "Alerta guardada localmente como respaldo.",
+            }
+            
+        except Exception as e:
+            log.error(f"  ❌ Error reenviando a Ami adultos: {e}")
+            
+            alerta_id_local = await _guardar_alerta_fallback(
+                req, cel_con, "ami", f"forward_error: {str(e)[:100]}"
+            )
+            
+            return {
+                "success": False,
+                "plataforma": "ami",
+                "error": str(e),
+                "fallback_alerta_id": alerta_id_local,
+            }
+    
+    # ============================================================
+    # PLATAFORMA DESCONOCIDA
+    # ============================================================
+    else:
+        raise HTTPException(
+            400, 
+            f"Plataforma '{plataforma}' no reconocida. Usa 'ami_sos' o 'ami'."
+        )
+
+
+# --- Función auxiliar: Guardar alerta como fallback ---
+
+async def _guardar_alerta_fallback(req: AlertaBLE, cel_con: str, plataforma: str, motivo: str) -> int:
+    """
+    Si el forward a Ami adultos falla, guarda la alerta localmente en PostgreSQL
+    para no perderla. Se puede reintentar después o notificar manualmente.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        alerta_id = await conn.fetchval("""
+            INSERT INTO alertas_panico 
+            (nombre, mensaje, fecha_hora, celular, atendida, id_persona, rol,
+             tipo_alerta, latitud, longitud, nivel_alerta, receptor_destino, 
+             fuente_alerta, nivel_emergencia)
+            VALUES ($1, $2, NOW(), $3, 'no', $4, 'usuario', $5, $6, $7, $8, 
+                    'cuidador', 'boton', $9)
+            RETURNING id
+        """, 
+            req.nombre or 'Usuario Ami',
+            f"[FALLBACK-{plataforma}] {motivo} — Alerta BLE de {req.nombre or 'Usuario'}",
+            cel_con,
+            req.id_persona,
+            req.tipo_alerta if req.tipo_alerta in ('salud','seguridad','violencia','incendio','caida','otro') else 'otro',
+            req.latitud,
+            req.longitud,
+            'critica' if req.nivel_emergencia >= 2 else 'leve',
+            req.nivel_emergencia,
+        )
+        
+        log.warning(f"  💾 FALLBACK: Alerta guardada localmente ID={alerta_id} ({motivo})")
+        return alerta_id
+
+
+# ==================== ENDPOINT DE PRUEBA BLE ====================
+
+@app.post("/ble/test")
+async def test_ble_endpoint(req: AlertaBLE):
+    """
+    Endpoint de prueba para verificar conectividad desde la app Flutter.
+    No guarda nada, solo confirma que el endpoint está vivo y los datos llegan bien.
+    """
+    cel_sin, cel_con = normalizar_celular(req.celular)
+    
+    return {
+        "success": True,
+        "test": True,
+        "mensaje": "Endpoint BLE unificado funcionando correctamente",
+        "datos_recibidos": {
+            "celular": cel_con,
+            "plataforma": req.plataforma,
+            "nivel_emergencia": req.nivel_emergencia,
+            "tipo_alerta": req.tipo_alerta,
+            "tiene_gps": req.latitud is not None and req.longitud is not None,
+            "mac_dispositivo": req.mac_dispositivo,
+        },
+        "ami_adultos_configurado": bool(AMI_ADULTOS_URL),
+        "timestamp": datetime.now().isoformat(),
+    }
 
 # ==================== CLASIFICAR CON CLAUDE ====================
 
