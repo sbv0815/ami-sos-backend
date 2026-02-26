@@ -1448,22 +1448,59 @@ async def panel_evidencias(alerta_id: int, request: Request):
     user = await _verificar_token_panel(request)
     await _auditar(user['usuario_id'], "ver_evidencia", f"alerta_id={alerta_id}")
     try:
-        from firebase_admin import storage
-        bucket = storage.bucket()
-        blobs = list(bucket.list_blobs(prefix=f"alertas/{alerta_id}/"))
+        from google.cloud import storage as gcs
+        client = gcs.Client()
+        bucket_name = os.getenv('FIREBASE_STORAGE_BUCKET', '')
+        if not bucket_name:
+            return {"success": True, "evidencias": [], "total": 0, "nota": "FIREBASE_STORAGE_BUCKET no configurado"}
+        bucket = client.bucket(bucket_name)
+        
+        # Buscar en AMBAS rutas posibles (Flutter usa emergencias/, legacy usa alertas/)
         evidencias = []
-        for blob in blobs:
-            url = blob.generate_signed_url(expiration=timedelta(hours=1))
-            evidencias.append({
-                "nombre": blob.name.split("/")[-1], "url": url,
-                "tipo": "imagen" if blob.content_type and "image" in blob.content_type else "otro",
-                "tamano": blob.size,
-                "subido_en": blob.time_created.isoformat() if blob.time_created else None,
-            })
+        prefijos = [
+            f"alertas/{alerta_id}/",
+        ]
+        # Buscar en emergencias/*/alert_{alerta_id}/
+        # Listar fechas disponibles
+        try:
+            fecha_blobs = list(bucket.list_blobs(prefix="emergencias/", delimiter="/"))
+            for blob in bucket.list_blobs(prefix="emergencias/", delimiter="/"):
+                pass  # iterator consume
+            # Buscar directamente con patrón alert_{id}
+            all_blobs = list(bucket.list_blobs(prefix=f"emergencias/"))
+            for blob in all_blobs:
+                if f"alert_{alerta_id}/" in blob.name:
+                    if blob.content_type and ('image' in blob.content_type or 'video' in blob.content_type):
+                        url = blob.generate_signed_url(expiration=timedelta(hours=1))
+                        evidencias.append({
+                            "nombre": blob.name.split("/")[-1], "url": url, "ruta": blob.name,
+                            "tipo": "imagen" if "image" in blob.content_type else "video",
+                            "tamano": blob.size,
+                            "subido_en": blob.time_created.isoformat() if blob.time_created else None,
+                        })
+        except Exception as e:
+            log.warning(f"Error buscando en emergencias/: {e}")
+        
+        # También buscar en ruta legacy
+        try:
+            for blob in bucket.list_blobs(prefix=f"alertas/{alerta_id}/"):
+                if blob.content_type and ('image' in blob.content_type or 'video' in blob.content_type):
+                    url = blob.generate_signed_url(expiration=timedelta(hours=1))
+                    evidencias.append({
+                        "nombre": blob.name.split("/")[-1], "url": url, "ruta": blob.name,
+                        "tipo": "imagen" if "image" in blob.content_type else "video",
+                        "tamano": blob.size,
+                        "subido_en": blob.time_created.isoformat() if blob.time_created else None,
+                    })
+        except Exception:
+            pass
+        
         return {"success": True, "evidencias": evidencias, "total": len(evidencias)}
+    except ImportError:
+        return {"success": True, "evidencias": [], "total": 0, "nota": "google-cloud-storage no instalado"}
     except Exception as e:
         log.warning(f"Error accediendo evidencias: {e}")
-        return {"success": True, "evidencias": [], "total": 0, "nota": "Firebase Storage no configurado o sin evidencias"}
+        return {"success": True, "evidencias": [], "total": 0, "nota": str(e)}
 
 # ================================================================
 # PANEL — AUDITORÍA
@@ -1715,19 +1752,34 @@ async def analizar_todas_evidencias(alerta_id: int, bg: BackgroundTasks):
         from google.cloud import storage as gcs
         client = gcs.Client()
         bucket = client.bucket(bucket_name)
-        blobs = list(bucket.list_blobs(prefix=f"alertas/{alerta_id}/"))
-        imagenes = [b for b in blobs if b.content_type and 'image' in b.content_type]
+        
+        # Buscar en AMBAS rutas: emergencias/*/alert_{id}/ y alertas/{id}/
+        imagenes = []
+        
+        # Ruta Flutter: emergencias/*/alert_{alerta_id}/
+        for blob in bucket.list_blobs(prefix="emergencias/"):
+            if f"alert_{alerta_id}/" in blob.name:
+                if blob.content_type and 'image' in blob.content_type:
+                    imagenes.append(blob)
+        
+        # Ruta legacy: alertas/{alerta_id}/
+        for blob in bucket.list_blobs(prefix=f"alertas/{alerta_id}/"):
+            if blob.content_type and 'image' in blob.content_type:
+                imagenes.append(blob)
         
         if not imagenes:
-            return {"success": True, "alerta_id": alerta_id, "imagenes": 0, "mensaje": "Sin imágenes"}
+            return {"success": True, "alerta_id": alerta_id, "imagenes": 0, "mensaje": "Sin imágenes para analizar"}
+        
+        log.info(f"🧠 Encontradas {len(imagenes)} imágenes para alerta #{alerta_id}")
         
         bg.add_task(_analizar_batch, alerta_id, bucket_name,
                     [b.name for b in imagenes], alerta['tipo_alerta'], alerta['nivel_emergencia'])
         
         return {"success": True, "alerta_id": alerta_id, "imagenes": len(imagenes),
-                "mensaje": f"Análisis de {len(imagenes)} imágenes iniciado en background"}
+                "mensaje": f"Análisis de {len(imagenes)} imágenes iniciado en background",
+                "archivos": [b.name.split('/')[-1] for b in imagenes]}
     except ImportError:
-        raise HTTPException(500, "google-cloud-storage no instalado")
+        raise HTTPException(500, "google-cloud-storage no instalado. Agrega al requirements.txt")
     except Exception as e:
         raise HTTPException(502, f"Error Firebase Storage: {str(e)}")
 
@@ -1753,6 +1805,30 @@ async def _analizar_batch(alerta_id, bucket_name, rutas, tipo_alerta, nivel_emer
 
 
 # --- Consultar análisis de una alerta ---
+
+# --- Consultar análisis de una alerta ---
+
+@app.get("/evidencia/listar/{alerta_id}")
+async def listar_evidencias_firebase(alerta_id: int):
+    """Lista archivos en Firebase Storage para una alerta (debug/test)."""
+    bucket_name = os.getenv('FIREBASE_STORAGE_BUCKET', '')
+    if not bucket_name:
+        raise HTTPException(500, "FIREBASE_STORAGE_BUCKET no configurado")
+    try:
+        from google.cloud import storage as gcs
+        client = gcs.Client()
+        bucket = client.bucket(bucket_name)
+        archivos = []
+        # Buscar en emergencias/*/alert_{id}/
+        for blob in bucket.list_blobs(prefix="emergencias/"):
+            if f"alert_{alerta_id}/" in blob.name:
+                archivos.append({"nombre": blob.name, "tipo": blob.content_type, "tamano": blob.size})
+        # Buscar en alertas/{id}/
+        for blob in bucket.list_blobs(prefix=f"alertas/{alerta_id}/"):
+            archivos.append({"nombre": blob.name, "tipo": blob.content_type, "tamano": blob.size})
+        return {"success": True, "alerta_id": alerta_id, "archivos": archivos, "total": len(archivos)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @app.get("/evidencia/analisis/{alerta_id}")
 async def obtener_analisis(alerta_id: int):
