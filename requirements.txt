@@ -6,3 +6,4 @@ PyJWT
 cryptography
 pydantic
 bcrypt
+google-cloud-storage

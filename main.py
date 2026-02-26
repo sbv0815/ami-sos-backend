@@ -33,6 +33,7 @@ import logging
 import time
 import asyncpg
 import re
+import base64
 import secrets
 import bcrypt
 
@@ -214,6 +215,17 @@ class CrearUsuarioPanel(BaseModel):
     rol: str = "cuidador"
     tipo_institucional: Optional[str] = None
     celular: Optional[str] = None
+
+class AnalizarEvidenciaRequest(BaseModel):
+    alerta_id: int
+    imagen_base64: Optional[str] = None
+    imagen_url: Optional[str] = None
+    imagen_nombre: Optional[str] = None
+    tipo_alerta: Optional[str] = None
+    nivel_emergencia: Optional[int] = None
+    ubicacion: Optional[str] = None
+    mensaje_usuario: Optional[str] = None
+    media_type: Optional[str] = "image/jpeg"
 
 # ==================== UTILIDADES ====================
 
@@ -798,7 +810,7 @@ Niveles: 1=leve(cuidadores), 2=grave(+institucionales), 3=crítica(+red comunita
 
     async with httpx.AsyncClient() as client:
         resp = await client.post("https://api.anthropic.com/v1/messages",
-            json={'model':'claude-sonnet-4-20250514','max_tokens':500,'messages':[{'role':'user','content':prompt}]},
+            json={'model': 'claude-sonnet-4-5-20250929', 'max_tokens': 500, 'messages': [{'role': 'user', 'content': prompt}]},
             headers={'Content-Type':'application/json','x-api-key':api_key,'anthropic-version':'2023-06-01'}, timeout=30)
         if resp.status_code != 200:
             raise HTTPException(502, f"Error Claude: {resp.status_code}")
@@ -1081,6 +1093,44 @@ async def migrar_tablas_panel():
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_ubicaciones_red_actualizado ON ubicaciones_red(actualizado_at)")
         except Exception:
             pass
+        
+        # Tabla de análisis de evidencia con IA
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS analisis_evidencia (
+                id SERIAL PRIMARY KEY,
+                alerta_id INTEGER NOT NULL,
+                archivo_nombre VARCHAR(255),
+                archivo_url TEXT,
+                clasificacion VARCHAR(50),
+                urgencia VARCHAR(20) NOT NULL DEFAULT 'media',
+                descripcion TEXT,
+                objetos_detectados TEXT,
+                personas_detectadas INTEGER DEFAULT 0,
+                hay_heridos BOOLEAN DEFAULT FALSE,
+                hay_armas BOOLEAN DEFAULT FALSE,
+                hay_fuego_humo BOOLEAN DEFAULT FALSE,
+                hay_vehiculos BOOLEAN DEFAULT FALSE,
+                hay_dano_propiedad BOOLEAN DEFAULT FALSE,
+                accion_sugerida TEXT,
+                despachar_ambulancia BOOLEAN DEFAULT FALSE,
+                despachar_policia BOOLEAN DEFAULT FALSE,
+                despachar_bomberos BOOLEAN DEFAULT FALSE,
+                llamar_123 BOOLEAN DEFAULT FALSE,
+                confianza DECIMAL(3,2) DEFAULT 0.00,
+                modelo_ia VARCHAR(50) DEFAULT 'claude-sonnet-4-5',
+                tokens_usados INTEGER DEFAULT 0,
+                tiempo_analisis_ms INTEGER DEFAULT 0,
+                contenido_sensible BOOLEAN DEFAULT FALSE,
+                tipo_contenido_sensible VARCHAR(50),
+                creado_en TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_analisis_alerta ON analisis_evidencia(alerta_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_analisis_urgencia ON analisis_evidencia(urgencia)")
+        except Exception:
+            pass
+        log.info("✅ Tabla analisis_evidencia verificada")
         
         log.info("🟢 Migración panel administrativo completa")
 
@@ -1438,6 +1488,310 @@ async def panel_auditoria(request: Request, page: int = 1, limit: int = 50):
         "success": True, "registros": [row_to_dict(r) for r in rows],
         "total": total, "page": page, "pages": (total + limit - 1) // limit if total > 0 else 0,
     }
+
+# ================================================================
+# 🧠 ANÁLISIS DE EVIDENCIA CON IA (Claude Vision)
+# ================================================================
+
+async def analizar_imagen_con_ia(imagen_base64: str, media_type: str = "image/jpeg", contexto: dict = None) -> dict:
+    """Envía imagen a Claude Vision y obtiene análisis de emergencia."""
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY no configurada"}
+    
+    ctx = contexto or {}
+    tipo = ctx.get('tipo_alerta', 'desconocido')
+    nivel = ctx.get('nivel_emergencia', 'desconocido')
+    ubicacion = ctx.get('ubicacion', 'Bogotá, Colombia')
+    mensaje = ctx.get('mensaje_usuario', '')
+    
+    system_prompt = """Eres un analista de emergencias de Bogotá, Colombia. 
+Analizas imágenes de alertas ciudadanas para los operadores del 123.
+
+REGLAS:
+- Sé preciso y objetivo. No especules más allá de lo visible.
+- Si la imagen es borrosa/oscura, dilo claramente.
+- Si detectas posible contenido de abuso infantil (CSAM), marca contenido_sensible=true 
+  y tipo_contenido_sensible="posible_csam" SIN describir la imagen.
+- Si no parece emergencia (meme, paisaje, selfie), clasifica como "no_emergencia".
+- Prioriza siempre la seguridad de las personas.
+
+Responde ÚNICAMENTE en JSON válido, sin markdown."""
+
+    user_prompt = f"""Analiza esta imagen de una alerta ciudadana.
+
+CONTEXTO:
+- Tipo reportado: {tipo}
+- Nivel reportado: {nivel}
+- Ubicación: {ubicacion}
+- Mensaje: {mensaje or 'Sin mensaje'}
+
+Responde SOLO con este JSON:
+{{"clasificacion":"accidente_transito|robo_hurto|agresion_fisica|incendio|inundacion|dano_propiedad|persona_herida|persona_sospechosa|vehiculo_sospechoso|situacion_riesgo|caida_persona|emergencia_medica|no_emergencia|imagen_no_clara","urgencia":"critica|alta|media|baja|no_emergencia","descripcion":"máximo 2 líneas","objetos_detectados":"lista separada por coma","personas_detectadas":0,"hay_heridos":false,"hay_armas":false,"hay_fuego_humo":false,"hay_vehiculos":false,"hay_dano_propiedad":false,"accion_sugerida":"1-2 líneas para el operador del 123","despachar_ambulancia":false,"despachar_policia":false,"despachar_bomberos":false,"llamar_123":false,"confianza":0.0,"contenido_sensible":false,"tipo_contenido_sensible":null,"coincide_con_tipo_reportado":true,"nivel_sugerido":1}}"""
+
+    inicio = time.time()
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post("https://api.anthropic.com/v1/messages",
+                json={
+                    'model': 'claude-sonnet-4-5-20250929', 'max_tokens': 1000,
+                    'system': system_prompt,
+                    'messages': [{'role': 'user', 'content': [
+                        {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type, 'data': imagen_base64}},
+                        {'type': 'text', 'text': user_prompt}
+                    ]}]
+                },
+                headers={'Content-Type': 'application/json', 'x-api-key': api_key, 'anthropic-version': '2023-06-01'},
+                timeout=60)
+            
+            ms = round((time.time() - inicio) * 1000)
+            if resp.status_code != 200:
+                return {"error": f"Claude API HTTP {resp.status_code}", "tiempo_ms": ms}
+            
+            data = resp.json()
+            text = data['content'][0]['text']
+            tokens = data.get('usage', {}).get('input_tokens', 0) + data.get('usage', {}).get('output_tokens', 0)
+            
+            match = re.search(r'\{[\s\S]*\}', text)
+            if match:
+                analisis = json.loads(match.group())
+                analisis['tokens_usados'] = tokens
+                analisis['tiempo_analisis_ms'] = ms
+                analisis['modelo_ia'] = 'claude-sonnet-4-5'
+                return analisis
+            return {"error": "No se pudo parsear respuesta", "tiempo_ms": ms}
+    except httpx.TimeoutException:
+        return {"error": "Timeout (60s)", "tiempo_ms": round((time.time() - inicio) * 1000)}
+    except Exception as e:
+        return {"error": str(e), "tiempo_ms": round((time.time() - inicio) * 1000)}
+
+
+async def descargar_imagen_firebase(bucket_name: str, ruta_archivo: str) -> dict:
+    """Descarga imagen de Firebase Storage y la convierte a base64."""
+    try:
+        from google.cloud import storage as gcs
+        client = gcs.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(ruta_archivo)
+        contenido = blob.download_as_bytes()
+        
+        content_type = blob.content_type or "image/jpeg"
+        if ruta_archivo.lower().endswith('.png'): content_type = "image/png"
+        elif ruta_archivo.lower().endswith('.webp'): content_type = "image/webp"
+        
+        return {"success": True, "base64": base64.b64encode(contenido).decode('utf-8'),
+                "media_type": content_type, "tamano_bytes": len(contenido)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def guardar_analisis(alerta_id: int, archivo_nombre: str, archivo_url: str, analisis: dict) -> int:
+    """Guarda resultado de análisis de IA en la base de datos."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("""
+            INSERT INTO analisis_evidencia (
+                alerta_id, archivo_nombre, archivo_url,
+                clasificacion, urgencia, descripcion, objetos_detectados,
+                personas_detectadas, hay_heridos, hay_armas, hay_fuego_humo,
+                hay_vehiculos, hay_dano_propiedad,
+                accion_sugerida, despachar_ambulancia, despachar_policia, despachar_bomberos,
+                llamar_123, confianza, modelo_ia, tokens_usados, tiempo_analisis_ms,
+                contenido_sensible, tipo_contenido_sensible
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+            RETURNING id
+        """, alerta_id, archivo_nombre, archivo_url,
+            analisis.get('clasificacion', 'sin_clasificar'), analisis.get('urgencia', 'media'),
+            analisis.get('descripcion', ''), analisis.get('objetos_detectados', ''),
+            analisis.get('personas_detectadas', 0), analisis.get('hay_heridos', False),
+            analisis.get('hay_armas', False), analisis.get('hay_fuego_humo', False),
+            analisis.get('hay_vehiculos', False), analisis.get('hay_dano_propiedad', False),
+            analisis.get('accion_sugerida', ''), analisis.get('despachar_ambulancia', False),
+            analisis.get('despachar_policia', False), analisis.get('despachar_bomberos', False),
+            analisis.get('llamar_123', False), analisis.get('confianza', 0.0),
+            analisis.get('modelo_ia', 'claude-sonnet-4-5'), analisis.get('tokens_usados', 0),
+            analisis.get('tiempo_analisis_ms', 0), analisis.get('contenido_sensible', False),
+            analisis.get('tipo_contenido_sensible'))
+
+
+# --- Endpoint: Analizar UNA imagen ---
+
+@app.post("/evidencia/analizar")
+async def analizar_evidencia(req: AnalizarEvidenciaRequest):
+    """
+    🧠 Analizar imagen con Claude Vision.
+    Acepta base64 directo o ruta de Firebase Storage.
+    """
+    inicio = time.time()
+    imagen_b64 = None
+    media_type = req.media_type or "image/jpeg"
+    archivo_nombre = req.imagen_nombre or "evidencia"
+    archivo_url = ""
+    
+    if req.imagen_base64:
+        imagen_b64 = req.imagen_base64
+        if ',' in imagen_b64:
+            parts = imagen_b64.split(',')
+            imagen_b64 = parts[1]
+            if 'png' in parts[0]: media_type = "image/png"
+            elif 'webp' in parts[0]: media_type = "image/webp"
+        log.info(f"🧠 Analizando imagen base64 para alerta #{req.alerta_id}")
+    elif req.imagen_url:
+        bucket_name = os.getenv('FIREBASE_STORAGE_BUCKET', '')
+        if not bucket_name:
+            raise HTTPException(500, "FIREBASE_STORAGE_BUCKET no configurado")
+        resultado = await descargar_imagen_firebase(bucket_name, req.imagen_url)
+        if not resultado.get('success'):
+            raise HTTPException(502, f"Error descargando: {resultado.get('error')}")
+        imagen_b64 = resultado['base64']
+        media_type = resultado['media_type']
+        archivo_url = req.imagen_url
+        archivo_nombre = req.imagen_url.split('/')[-1] if '/' in req.imagen_url else req.imagen_url
+    else:
+        raise HTTPException(400, "Se requiere imagen_base64 o imagen_url")
+    
+    if len(imagen_b64) > 20_000_000:
+        raise HTTPException(413, "Imagen muy grande (máximo ~15MB)")
+    
+    # Contexto
+    contexto = {'tipo_alerta': req.tipo_alerta or 'desconocido',
+                'nivel_emergencia': req.nivel_emergencia or 'desconocido',
+                'ubicacion': req.ubicacion or 'Bogotá, Colombia',
+                'mensaje_usuario': req.mensaje_usuario or ''}
+    
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        alerta = await conn.fetchrow("SELECT tipo_alerta, nivel_emergencia, mensaje FROM alertas_panico WHERE id=$1", req.alerta_id)
+        if alerta:
+            if not req.tipo_alerta: contexto['tipo_alerta'] = alerta['tipo_alerta'] or 'desconocido'
+            if not req.nivel_emergencia: contexto['nivel_emergencia'] = alerta['nivel_emergencia'] or 'desconocido'
+    
+    analisis = await analizar_imagen_con_ia(imagen_b64, media_type, contexto)
+    
+    if 'error' in analisis:
+        return {"success": False, "alerta_id": req.alerta_id, "error": analisis['error']}
+    
+    analisis_id = await guardar_analisis(req.alerta_id, archivo_nombre, archivo_url, analisis)
+    ms = round((time.time() - inicio) * 1000)
+    
+    log.info(f"  ✅ Análisis #{analisis_id}: {analisis.get('clasificacion')} | urgencia={analisis.get('urgencia')}")
+    if analisis.get('hay_armas'): log.warning(f"  🔴 ARMAS DETECTADAS alerta #{req.alerta_id}")
+    if analisis.get('hay_heridos'): log.warning(f"  🔴 HERIDOS DETECTADOS alerta #{req.alerta_id}")
+    
+    return {
+        "success": True, "alerta_id": req.alerta_id, "analisis_id": analisis_id,
+        "clasificacion": analisis.get('clasificacion'), "urgencia": analisis.get('urgencia'),
+        "descripcion": analisis.get('descripcion'), "accion_sugerida": analisis.get('accion_sugerida'),
+        "despachar": {"ambulancia": analisis.get('despachar_ambulancia', False),
+                      "policia": analisis.get('despachar_policia', False),
+                      "bomberos": analisis.get('despachar_bomberos', False)},
+        "deteccion": {"personas": analisis.get('personas_detectadas', 0),
+                      "heridos": analisis.get('hay_heridos', False),
+                      "armas": analisis.get('hay_armas', False),
+                      "fuego_humo": analisis.get('hay_fuego_humo', False)},
+        "confianza": analisis.get('confianza'),
+        "contenido_sensible": analisis.get('contenido_sensible', False),
+        "nivel_sugerido": analisis.get('nivel_sugerido'),
+        "tiempo_total_ms": ms, "tokens_usados": analisis.get('tokens_usados', 0),
+    }
+
+
+# --- Endpoint: Analizar TODAS las imágenes de una alerta ---
+
+@app.post("/evidencia/analizar-todas/{alerta_id}")
+async def analizar_todas_evidencias(alerta_id: int, bg: BackgroundTasks):
+    """Analiza TODAS las imágenes de Firebase Storage para una alerta (background)."""
+    bucket_name = os.getenv('FIREBASE_STORAGE_BUCKET', '')
+    if not bucket_name:
+        raise HTTPException(500, "FIREBASE_STORAGE_BUCKET no configurado")
+    
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        alerta = await conn.fetchrow("SELECT id, tipo_alerta, nivel_emergencia FROM alertas_panico WHERE id=$1", alerta_id)
+    if not alerta:
+        raise HTTPException(404, "Alerta no encontrada")
+    
+    try:
+        from google.cloud import storage as gcs
+        client = gcs.Client()
+        bucket = client.bucket(bucket_name)
+        blobs = list(bucket.list_blobs(prefix=f"alertas/{alerta_id}/"))
+        imagenes = [b for b in blobs if b.content_type and 'image' in b.content_type]
+        
+        if not imagenes:
+            return {"success": True, "alerta_id": alerta_id, "imagenes": 0, "mensaje": "Sin imágenes"}
+        
+        bg.add_task(_analizar_batch, alerta_id, bucket_name,
+                    [b.name for b in imagenes], alerta['tipo_alerta'], alerta['nivel_emergencia'])
+        
+        return {"success": True, "alerta_id": alerta_id, "imagenes": len(imagenes),
+                "mensaje": f"Análisis de {len(imagenes)} imágenes iniciado en background"}
+    except ImportError:
+        raise HTTPException(500, "google-cloud-storage no instalado")
+    except Exception as e:
+        raise HTTPException(502, f"Error Firebase Storage: {str(e)}")
+
+
+async def _analizar_batch(alerta_id, bucket_name, rutas, tipo_alerta, nivel_emergencia):
+    """Background: analiza múltiples imágenes."""
+    import asyncio
+    resultados = []
+    for ruta in rutas:
+        try:
+            desc = await descargar_imagen_firebase(bucket_name, ruta)
+            if not desc.get('success'): continue
+            analisis = await analizar_imagen_con_ia(desc['base64'], desc['media_type'],
+                {'tipo_alerta': tipo_alerta, 'nivel_emergencia': nivel_emergencia, 'ubicacion': 'Bogotá'})
+            if 'error' not in analisis:
+                aid = await guardar_analisis(alerta_id, ruta.split('/')[-1], ruta, analisis)
+                resultados.append(analisis)
+                log.info(f"  ✅ {ruta.split('/')[-1]}: {analisis.get('clasificacion')} ({analisis.get('urgencia')})")
+            await asyncio.sleep(1)
+        except Exception as e:
+            log.error(f"  ❌ {ruta}: {e}")
+    log.info(f"🧠 Batch alerta #{alerta_id}: {len(resultados)}/{len(rutas)} analizadas")
+
+
+# --- Consultar análisis de una alerta ---
+
+@app.get("/evidencia/analisis/{alerta_id}")
+async def obtener_analisis(alerta_id: int):
+    """Consultar todos los análisis de IA para una alerta."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, archivo_nombre, clasificacion, urgencia, descripcion,
+                   personas_detectadas, hay_heridos, hay_armas, hay_fuego_humo,
+                   accion_sugerida, despachar_ambulancia, despachar_policia, despachar_bomberos,
+                   confianza, contenido_sensible, creado_en
+            FROM analisis_evidencia WHERE alerta_id=$1 ORDER BY creado_en DESC
+        """, alerta_id)
+    
+    analisis_list = [row_to_dict(r) for r in rows]
+    resumen = {"total": len(analisis_list), "urgencia_maxima": "no_emergencia",
+               "hay_heridos": False, "hay_armas": False}
+    urgencias = {'critica': 5, 'alta': 4, 'media': 3, 'baja': 2, 'no_emergencia': 1}
+    max_u = 0
+    for a in analisis_list:
+        u = urgencias.get(a.get('urgencia', ''), 0)
+        if u > max_u: max_u = u; resumen['urgencia_maxima'] = a['urgencia']
+        if a.get('hay_heridos'): resumen['hay_heridos'] = True
+        if a.get('hay_armas'): resumen['hay_armas'] = True
+    
+    return {"success": True, "alerta_id": alerta_id, "resumen": resumen, "analisis": analisis_list}
+
+
+# --- Panel: ver análisis ---
+
+@app.get("/panel/analisis/{alerta_id}")
+async def panel_analisis(alerta_id: int, request: Request):
+    user = await _verificar_token_panel(request)
+    await _auditar(user['usuario_id'], "ver_analisis_ia", f"alerta_id={alerta_id}")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM analisis_evidencia WHERE alerta_id=$1 ORDER BY creado_en DESC", alerta_id)
+    return {"success": True, "alerta_id": alerta_id, "analisis": [row_to_dict(r) for r in rows]}
+
 
 # ==================== HEALTH ====================
 
