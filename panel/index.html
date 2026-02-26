@@ -509,7 +509,7 @@ function navigate(pageId) {
 function initMapa() {
     if (!mapaInstance) {
         mapaInstance = L.map('mapa-alertas').setView([4.6097, -74.0817], 12); // Bogotá
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
             attribution: '© OpenStreetMap © CARTO',
             maxZoom: 19
         }).addTo(mapaInstance);
