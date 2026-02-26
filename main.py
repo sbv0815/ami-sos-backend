@@ -759,17 +759,40 @@ async def _enviar_notificaciones_v2(pool, alerta_id, nombre, mensaje, tipo_alert
             mensaje = f"{nombre} necesita ayuda a {dist_txt}. Puedes: llamar 123, grabar video como evidencia, o acercarte si es seguro."
         
         ok = False
+        canal_usado = 'ninguno'
+        
+        # 1️⃣ Push FCM
         if token:
             result = await enviar_push(token, titulo, mensaje, data_push)
             ok = result['success']
             if ok:
                 notificados += 1
-                log.info(f"    ✅ [{dest['rol_dest']}] {dest['nombre']}")
+                canal_usado = 'push'
+                log.info(f"    ✅ [{dest['rol_dest']}] {dest['nombre']} (push)")
             else:
-                log.warning(f"    ❌ [{dest['rol_dest']}] {dest['nombre']}: {result.get('error','')}")
+                log.warning(f"    ❌ Push falló [{dest['rol_dest']}] {dest['nombre']}: {result.get('error','')}")
                 if 'UNREGISTERED' in str(result.get('error','')) or 'INVALID' in str(result.get('error','')):
                     async with pool.acquire() as conn:
                         await conn.execute("UPDATE tokens_fcm SET valido=FALSE, motivo_invalidez='token_invalido', fecha_invalido=NOW() WHERE celular IN ($1,$2)", cs, cc)
+        
+        # 2️⃣ FALLBACK: WhatsApp → SMS
+        if not ok:
+            maps_link = f"https://maps.google.com/?q={lat},{lon}" if lat and lon else ""
+            msg_fb = f"{titulo}\n\n{mensaje}"
+            if maps_link:
+                msg_fb += f"\n\n📍 Ubicación: {maps_link}"
+            
+            wa = await enviar_whatsapp_twilio(dest['celular'], msg_fb)
+            if wa['success']:
+                ok, canal_usado, notificados = True, 'whatsapp', notificados + 1
+                log.info(f"    ✅ [{dest['rol_dest']}] {dest['nombre']} (WhatsApp)")
+            else:
+                sms = await enviar_sms_twilio(dest['celular'], msg_fb[:160])
+                if sms['success']:
+                    ok, canal_usado, notificados = True, 'sms', notificados + 1
+                    log.info(f"    ✅ [{dest['rol_dest']}] {dest['nombre']} (SMS)")
+                else:
+                    log.error(f"    🔴 TODOS FALLARON: {dest['nombre']} ({dest['celular']})")
         
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -778,10 +801,64 @@ async def _enviar_notificaciones_v2(pool, alerta_id, nombre, mensaje, tipo_alert
                     token, mensaje, fecha, estado_envio, rol_destinatario, receptor_destino)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8,$9,$10)
             """, alerta_id, cel_usuario, nombre, dest['celular'], dest['nombre'],
-                token or '', mensaje, 'enviado' if ok else 'fallido',
+                token or '', mensaje, f'{canal_usado}_ok' if ok else 'fallido_todos',
                 dest['rol_dest'], dest.get('entidad', dest['rol_dest']))
-    
     log.info(f"  📊 Nivel {nivel}: {notificados}/{len(todos)} notificados")
+
+
+# ==================== TWILIO: WhatsApp + SMS ====================
+
+TWILIO_SID = os.getenv('TWILIO_ACCOUNT_SID', '')
+TWILIO_TOKEN = os.getenv('TWILIO_AUTH_TOKEN', '')
+TWILIO_PHONE = os.getenv('TWILIO_PHONE_NUMBER', '')
+TWILIO_WHATSAPP = os.getenv('TWILIO_WHATSAPP_FROM', '')
+
+
+def _normalizar_telefono_twilio(celular: str) -> str:
+    cel = re.sub(r'[^\d]', '', celular)
+    if cel.startswith('57') and len(cel) == 12:
+        return f"+{cel}"
+    if len(cel) == 10 and cel.startswith('3'):
+        return f"+57{cel}"
+    return f"+{cel}"
+
+
+async def enviar_whatsapp_twilio(celular: str, mensaje: str) -> dict:
+    if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_WHATSAPP:
+        return {'success': False, 'error': 'Twilio WhatsApp no configurado'}
+    to_number = _normalizar_telefono_twilio(celular)
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, auth=(TWILIO_SID, TWILIO_TOKEN),
+                data={'From': TWILIO_WHATSAPP, 'To': f'whatsapp:{to_number}', 'Body': mensaje}, timeout=15)
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                log.info(f"    📱 WhatsApp enviado a {to_number}: SID={data.get('sid','')}")
+                return {'success': True, 'sid': data.get('sid'), 'canal': 'whatsapp'}
+            else:
+                return {'success': False, 'error': f'HTTP {resp.status_code}: {resp.text[:200]}'}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+async def enviar_sms_twilio(celular: str, mensaje: str) -> dict:
+    if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_PHONE:
+        return {'success': False, 'error': 'Twilio SMS no configurado'}
+    to_number = _normalizar_telefono_twilio(celular)
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, auth=(TWILIO_SID, TWILIO_TOKEN),
+                data={'From': TWILIO_PHONE, 'To': to_number, 'Body': mensaje[:1600]}, timeout=15)
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                log.info(f"    💬 SMS enviado a {to_number}: SID={data.get('sid','')}")
+                return {'success': True, 'sid': data.get('sid'), 'canal': 'sms'}
+            else:
+                return {'success': False, 'error': f'HTTP {resp.status_code}: {resp.text[:200]}'}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
 
 # ==================== POST /alerta/responder ====================
 
