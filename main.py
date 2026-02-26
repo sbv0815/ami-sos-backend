@@ -1130,14 +1130,46 @@ async def migrar_tablas_panel():
                 tiempo_analisis_ms INTEGER DEFAULT 0,
                 contenido_sensible BOOLEAN DEFAULT FALSE,
                 tipo_contenido_sensible VARCHAR(50),
-                creado_en TIMESTAMP DEFAULT NOW()
+                creado_en TIMESTAMP DEFAULT NOW(),
+                
+                -- Revisión humana
+                estado_revision VARCHAR(20) DEFAULT 'pendiente',
+                revision_clasificacion VARCHAR(50),
+                revision_urgencia VARCHAR(20),
+                revision_accion TEXT,
+                revision_notas TEXT,
+                revision_despachar_ambulancia BOOLEAN,
+                revision_despachar_policia BOOLEAN,
+                revision_despachar_bomberos BOOLEAN,
+                revisado_por INTEGER,
+                revisado_nombre VARCHAR(100),
+                revisado_en TIMESTAMP
             )
         """)
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_analisis_alerta ON analisis_evidencia(alerta_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_analisis_urgencia ON analisis_evidencia(urgencia)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_analisis_revision ON analisis_evidencia(estado_revision)")
         except Exception:
             pass
+        # Agregar columnas de revisión si tabla ya existía
+        for col, tipo in [
+            ('estado_revision', "VARCHAR(20) DEFAULT 'pendiente'"),
+            ('revision_clasificacion', 'VARCHAR(50)'),
+            ('revision_urgencia', 'VARCHAR(20)'),
+            ('revision_accion', 'TEXT'),
+            ('revision_notas', 'TEXT'),
+            ('revision_despachar_ambulancia', 'BOOLEAN'),
+            ('revision_despachar_policia', 'BOOLEAN'),
+            ('revision_despachar_bomberos', 'BOOLEAN'),
+            ('revisado_por', 'INTEGER'),
+            ('revisado_nombre', 'VARCHAR(100)'),
+            ('revisado_en', 'TIMESTAMP'),
+        ]:
+            try:
+                await conn.execute(f"ALTER TABLE analisis_evidencia ADD COLUMN IF NOT EXISTS {col} {tipo}")
+            except Exception:
+                pass
         log.info("✅ Tabla analisis_evidencia verificada")
         
         log.info("🟢 Migración panel administrativo completa")
@@ -1875,6 +1907,303 @@ async def panel_analisis(alerta_id: int, request: Request):
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM analisis_evidencia WHERE alerta_id=$1 ORDER BY creado_en DESC", alerta_id)
     return {"success": True, "alerta_id": alerta_id, "analisis": [row_to_dict(r) for r in rows]}
+
+
+# ================================================================
+# 🔔 WEBHOOK: App Flutter notifica que subió evidencia
+# ================================================================
+
+class EvidenciaSubida(BaseModel):
+    """La app Flutter llama este endpoint después de subir foto/video a Firebase Storage."""
+    alerta_id: int
+    celular: str
+    ruta_firebase: str              # Ruta completa en Firebase: emergencias/2026-02-26/alert_28/foto.jpg
+    tipo_archivo: str = "imagen"    # imagen, video
+    nombre_archivo: Optional[str] = None
+    media_type: Optional[str] = "image/jpeg"
+
+@app.post("/evidencia/notificar")
+async def notificar_evidencia_subida(req: EvidenciaSubida, bg: BackgroundTasks):
+    """
+    🔔 WEBHOOK AUTOMÁTICO
+    
+    La app Flutter llama este endpoint DESPUÉS de subir una foto/video a Firebase Storage.
+    Si es imagen → lanza análisis con Claude Vision automáticamente en background.
+    Si es video → registra pero no analiza (Claude no procesa video).
+    
+    Uso desde Flutter:
+        await http.post('/evidencia/notificar', body: {
+            "alerta_id": 28,
+            "celular": "573001234567",
+            "ruta_firebase": "emergencias/2026-02-26/alert_28/foto1.jpg",
+            "tipo_archivo": "imagen"
+        });
+    """
+    log.info(f"📸 Evidencia subida: alerta #{req.alerta_id} → {req.ruta_firebase} ({req.tipo_archivo})")
+    
+    pool = await get_pool()
+    
+    # Registrar en BD que se recibió evidencia
+    async with pool.acquire() as conn:
+        # Verificar que la alerta existe
+        alerta = await conn.fetchrow(
+            "SELECT id, tipo_alerta, nivel_emergencia, nombre FROM alertas_panico WHERE id=$1",
+            req.alerta_id)
+        if not alerta:
+            raise HTTPException(404, "Alerta no encontrada")
+    
+    resultado = {
+        "success": True,
+        "alerta_id": req.alerta_id,
+        "ruta": req.ruta_firebase,
+        "tipo": req.tipo_archivo,
+        "analisis_iniciado": False,
+    }
+    
+    # Si es imagen → analizar automáticamente con IA en background
+    if req.tipo_archivo == "imagen" and req.ruta_firebase.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+        bucket_name = os.getenv('FIREBASE_STORAGE_BUCKET', '')
+        if bucket_name and os.getenv('ANTHROPIC_API_KEY'):
+            bg.add_task(
+                _analizar_evidencia_auto,
+                req.alerta_id,
+                bucket_name,
+                req.ruta_firebase,
+                alerta['tipo_alerta'],
+                alerta['nivel_emergencia']
+            )
+            resultado['analisis_iniciado'] = True
+            resultado['mensaje'] = "Imagen recibida. Análisis IA iniciado automáticamente."
+            log.info(f"  🧠 Análisis IA iniciado en background para {req.ruta_firebase}")
+        else:
+            resultado['mensaje'] = "Imagen recibida. Análisis IA no disponible (falta configuración)."
+    elif req.tipo_archivo == "video":
+        resultado['mensaje'] = "Video recibido. Los videos se almacenan como evidencia pero no se analizan con IA."
+    else:
+        resultado['mensaje'] = "Archivo recibido y registrado."
+    
+    return resultado
+
+
+async def _analizar_evidencia_auto(alerta_id: int, bucket_name: str, ruta: str,
+                                    tipo_alerta: str, nivel_emergencia: int):
+    """Background: descarga imagen de Firebase y la analiza con Claude Vision."""
+    try:
+        # Descargar imagen
+        desc = await descargar_imagen_firebase(bucket_name, ruta)
+        if not desc.get('success'):
+            log.warning(f"  ❌ No se pudo descargar {ruta}: {desc.get('error')}")
+            return
+        
+        # Analizar con IA
+        contexto = {
+            'tipo_alerta': tipo_alerta or 'desconocido',
+            'nivel_emergencia': nivel_emergencia or 2,
+            'ubicacion': 'Bogotá, Colombia',
+        }
+        
+        analisis = await analizar_imagen_con_ia(desc['base64'], desc['media_type'], contexto)
+        
+        if 'error' not in analisis:
+            analisis_id = await guardar_analisis(alerta_id, ruta.split('/')[-1], ruta, analisis)
+            log.info(f"  ✅ AUTO-ANÁLISIS #{analisis_id}: {analisis.get('clasificacion')} | urgencia={analisis.get('urgencia')} | confianza={analisis.get('confianza')}")
+            
+            # Si urgencia crítica o alta → actualizar alerta con nota de IA
+            if analisis.get('urgencia') in ('critica', 'alta'):
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute("""
+                        UPDATE alertas_panico 
+                        SET mensaje = mensaje || $1
+                        WHERE id = $2
+                    """, f" [🧠 IA: {analisis.get('clasificacion')} - {analisis.get('urgencia')}]", alerta_id)
+                log.warning(f"  🔴 URGENCIA {analisis.get('urgencia').upper()} detectada por IA en alerta #{alerta_id}")
+        else:
+            log.warning(f"  ❌ Error auto-análisis: {analisis['error']}")
+    
+    except Exception as e:
+        log.error(f"  ❌ Error en auto-análisis de {ruta}: {e}")
+
+
+# ================================================================
+# 📊 PANEL: Dashboard de análisis IA (estadísticas)
+# ================================================================
+
+@app.get("/panel/analisis-stats")
+async def panel_analisis_stats(request: Request):
+    """Estadísticas globales de análisis de IA (solo admin)."""
+    user = await _verificar_token_panel(request)
+    if user['rol'] != 'admin':
+        raise HTTPException(403, "Solo admin")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM analisis_evidencia") or 0
+        por_clasificacion = await conn.fetch("SELECT clasificacion, COUNT(*) as total FROM analisis_evidencia GROUP BY clasificacion ORDER BY total DESC")
+        por_urgencia = await conn.fetch("SELECT urgencia, COUNT(*) as total FROM analisis_evidencia GROUP BY urgencia ORDER BY total DESC")
+        con_armas = await conn.fetchval("SELECT COUNT(*) FROM analisis_evidencia WHERE hay_armas = TRUE") or 0
+        con_heridos = await conn.fetchval("SELECT COUNT(*) FROM analisis_evidencia WHERE hay_heridos = TRUE") or 0
+        promedio_confianza = await conn.fetchval("SELECT AVG(confianza) FROM analisis_evidencia")
+        promedio_tiempo = await conn.fetchval("SELECT AVG(tiempo_analisis_ms) FROM analisis_evidencia")
+        pendientes = await conn.fetchval("SELECT COUNT(*) FROM analisis_evidencia WHERE estado_revision = 'pendiente'") or 0
+        confirmados = await conn.fetchval("SELECT COUNT(*) FROM analisis_evidencia WHERE estado_revision = 'confirmado'") or 0
+        corregidos = await conn.fetchval("SELECT COUNT(*) FROM analisis_evidencia WHERE estado_revision = 'corregido'") or 0
+    return {
+        "success": True,
+        "stats": {
+            "total_analisis": total,
+            "por_clasificacion": [dict(r) for r in por_clasificacion],
+            "por_urgencia": [dict(r) for r in por_urgencia],
+            "con_armas": con_armas, "con_heridos": con_heridos,
+            "promedio_confianza": round(float(promedio_confianza or 0), 2),
+            "promedio_tiempo_ms": round(float(promedio_tiempo or 0)),
+            "revision": {"pendientes": pendientes, "confirmados": confirmados, "corregidos": corregidos},
+        }
+    }
+
+
+# ================================================================
+# 👁️ REVISIÓN HUMANA: Confirmar, corregir o escalar análisis de IA
+# ================================================================
+
+class RevisionAnalisis(BaseModel):
+    """Revisión humana de un análisis de IA."""
+    accion: str                                # "confirmar", "corregir", "escalar", "descartar"
+    clasificacion: Optional[str] = None        # Solo si corrige
+    urgencia: Optional[str] = None             # Solo si corrige
+    accion_sugerida: Optional[str] = None      # Solo si corrige
+    despachar_ambulancia: Optional[bool] = None
+    despachar_policia: Optional[bool] = None
+    despachar_bomberos: Optional[bool] = None
+    notas: Optional[str] = None                # Notas del revisor
+
+
+@app.get("/panel/revisiones-pendientes")
+async def panel_revisiones_pendientes(request: Request, limit: int = 20):
+    """Lista análisis de IA pendientes de revisión humana."""
+    user = await _verificar_token_panel(request)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT ae.id, ae.alerta_id, ae.archivo_nombre, ae.clasificacion, ae.urgencia,
+                   ae.descripcion, ae.accion_sugerida, ae.confianza,
+                   ae.hay_heridos, ae.hay_armas, ae.hay_fuego_humo,
+                   ae.despachar_ambulancia, ae.despachar_policia, ae.despachar_bomberos,
+                   ae.personas_detectadas, ae.contenido_sensible, ae.estado_revision,
+                   ae.creado_en,
+                   ap.nombre, ap.celular, ap.tipo_alerta as alerta_tipo, ap.nivel_emergencia,
+                   ap.latitud, ap.longitud
+            FROM analisis_evidencia ae
+            LEFT JOIN alertas_panico ap ON ae.alerta_id = ap.id
+            WHERE ae.estado_revision = 'pendiente'
+            ORDER BY 
+                CASE ae.urgencia 
+                    WHEN 'critica' THEN 1 WHEN 'alta' THEN 2 
+                    WHEN 'media' THEN 3 WHEN 'baja' THEN 4 ELSE 5 
+                END,
+                ae.creado_en DESC
+            LIMIT $1
+        """, limit)
+    return {
+        "success": True,
+        "pendientes": [row_to_dict(r) for r in rows],
+        "total": len(rows),
+    }
+
+
+@app.put("/panel/analisis/{analisis_id}/revisar")
+async def panel_revisar_analisis(analisis_id: int, req: RevisionAnalisis, request: Request):
+    """
+    👁️ REVISIÓN HUMANA de un análisis de IA.
+    
+    Acciones:
+    - confirmar: La IA acertó, se confirma el análisis tal cual
+    - corregir: La IA se equivocó, el humano corrige clasificación/urgencia/acciones
+    - escalar: Requiere atención superior, se marca para supervisor
+    - descartar: Falsa alarma o imagen irrelevante
+    """
+    user = await _verificar_token_panel(request)
+    
+    if req.accion not in ('confirmar', 'corregir', 'escalar', 'descartar'):
+        raise HTTPException(400, "Acción debe ser: confirmar, corregir, escalar, descartar")
+    
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Verificar que el análisis existe
+        analisis = await conn.fetchrow("SELECT * FROM analisis_evidencia WHERE id=$1", analisis_id)
+        if not analisis:
+            raise HTTPException(404, "Análisis no encontrado")
+        
+        if req.accion == 'confirmar':
+            await conn.execute("""
+                UPDATE analisis_evidencia SET
+                    estado_revision = 'confirmado',
+                    revision_clasificacion = clasificacion,
+                    revision_urgencia = urgencia,
+                    revision_accion = accion_sugerida,
+                    revision_despachar_ambulancia = despachar_ambulancia,
+                    revision_despachar_policia = despachar_policia,
+                    revision_despachar_bomberos = despachar_bomberos,
+                    revision_notas = $1,
+                    revisado_por = $2,
+                    revisado_nombre = $3,
+                    revisado_en = NOW()
+                WHERE id = $4
+            """, req.notas, user['usuario_id'], user['nombre'], analisis_id)
+        
+        elif req.accion == 'corregir':
+            await conn.execute("""
+                UPDATE analisis_evidencia SET
+                    estado_revision = 'corregido',
+                    revision_clasificacion = COALESCE($1, clasificacion),
+                    revision_urgencia = COALESCE($2, urgencia),
+                    revision_accion = COALESCE($3, accion_sugerida),
+                    revision_despachar_ambulancia = COALESCE($4, despachar_ambulancia),
+                    revision_despachar_policia = COALESCE($5, despachar_policia),
+                    revision_despachar_bomberos = COALESCE($6, despachar_bomberos),
+                    revision_notas = $7,
+                    revisado_por = $8,
+                    revisado_nombre = $9,
+                    revisado_en = NOW()
+                WHERE id = $10
+            """, req.clasificacion, req.urgencia, req.accion_sugerida,
+                req.despachar_ambulancia, req.despachar_policia, req.despachar_bomberos,
+                req.notas, user['usuario_id'], user['nombre'], analisis_id)
+        
+        elif req.accion == 'escalar':
+            await conn.execute("""
+                UPDATE analisis_evidencia SET
+                    estado_revision = 'escalado',
+                    revision_notas = $1,
+                    revisado_por = $2,
+                    revisado_nombre = $3,
+                    revisado_en = NOW()
+                WHERE id = $4
+            """, req.notas or 'Escalado a supervisor', user['usuario_id'], user['nombre'], analisis_id)
+        
+        elif req.accion == 'descartar':
+            await conn.execute("""
+                UPDATE analisis_evidencia SET
+                    estado_revision = 'descartado',
+                    revision_urgencia = 'no_emergencia',
+                    revision_notas = $1,
+                    revisado_por = $2,
+                    revisado_nombre = $3,
+                    revisado_en = NOW()
+                WHERE id = $4
+            """, req.notas or 'Descartado - falsa alarma', user['usuario_id'], user['nombre'], analisis_id)
+    
+    await _auditar(user['usuario_id'], f"revision_ia_{req.accion}", 
+                   f"analisis_id={analisis_id}, alerta_id={analisis['alerta_id']}")
+    
+    log.info(f"👁️ Análisis #{analisis_id} → {req.accion.upper()} por {user['nombre']}")
+    
+    return {
+        "success": True,
+        "analisis_id": analisis_id,
+        "accion": req.accion,
+        "revisado_por": user['nombre'],
+        "mensaje": f"Análisis {req.accion} exitosamente",
+    }
 
 
 # ==================== HEALTH ====================

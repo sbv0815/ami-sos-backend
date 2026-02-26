@@ -372,6 +372,15 @@
             </div>
         </div>
 
+        <!-- REVISIÓN IA -->
+        <div class="page" id="page-revision-ia">
+            <div class="page-header">
+                <h1>🧠 Revisión IA</h1>
+                <div id="revision-stats" style="font-size:13px;color:var(--text-dim)"></div>
+            </div>
+            <div id="revision-list"><div class="loading">Cargando análisis pendientes...</div></div>
+        </div>
+
         <!-- AUDITORIA -->
         <div class="page" id="page-auditoria">
             <div class="page-header">
@@ -475,6 +484,7 @@ function buildNav() {
         { id: 'alertas', icon: '🚨', label: 'Historial Alertas', roles: ['admin', 'policia', 'ambulancia', 'bomberos', 'cuidador'] },
         { id: 'dashboard', icon: '📊', label: 'Dashboard', roles: ['admin'] },
         { id: 'usuarios', icon: '👥', label: 'Usuarios', roles: ['admin'] },
+        { id: 'revision-ia', icon: '🧠', label: 'Revisión IA', roles: ['admin', 'policia', 'ambulancia', 'bomberos'] },
         { id: 'auditoria', icon: '📋', label: 'Auditoría', roles: ['admin'] },
     ];
     
@@ -502,6 +512,7 @@ function navigate(pageId) {
     else if (pageId === 'alertas') loadAlertas();
     else if (pageId === 'dashboard') loadDashboard();
     else if (pageId === 'usuarios') loadUsuarios();
+    else if (pageId === 'revision-ia') loadRevisionIA();
     else if (pageId === 'auditoria') loadAuditoria();
 }
 
@@ -657,11 +668,51 @@ async function verDetalle(id) {
         let evidHtml = '';
         try {
             const evid = await api(`/panel/evidencias/${id}`);
-            if (evid.evidencias.length) {
+            if (evid.evidencias && evid.evidencias.length) {
                 evidHtml = `<h3 style="margin-top:16px;font-size:14px">Evidencias (${evid.total})</h3>
                     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-                    ${evid.evidencias.map(e => `<img src="${e.url}" style="width:120px;height:90px;object-fit:cover;border-radius:6px;border:1px solid var(--border)" onerror="this.style.display='none'">`).join('')}
+                    ${evid.evidencias.map(e => 
+                        e.tipo === 'video' 
+                            ? `<div style="width:120px;height:90px;background:var(--bg);border-radius:6px;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--text-dim)">🎥 Video</div>`
+                            : `<img src="${e.url}" style="width:120px;height:90px;object-fit:cover;border-radius:6px;border:1px solid var(--border)" onerror="this.style.display='none'">`
+                    ).join('')}
                     </div>`;
+            }
+        } catch(e) {}
+        
+        let iaHtml = '';
+        try {
+            const ia = await api(`/panel/analisis/${id}`);
+            if (ia.analisis && ia.analisis.length) {
+                iaHtml = `<h3 style="margin-top:20px;font-size:14px">🧠 Análisis IA (${ia.analisis.length})</h3>`;
+                ia.analisis.forEach(an => {
+                    const urgColors = {critica:'#ef4444',alta:'#f59e0b',media:'#3b82f6',baja:'#22c55e',no_emergencia:'#94a3b8'};
+                    const urgColor = urgColors[an.urgencia] || '#94a3b8';
+                    let tags = '';
+                    if (an.despachar_ambulancia) tags += '<span style="background:rgba(34,197,94,0.2);color:#22c55e;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:4px">🚑 Ambulancia</span>';
+                    if (an.despachar_policia) tags += '<span style="background:rgba(59,130,246,0.2);color:#3b82f6;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:4px">🚔 Policía</span>';
+                    if (an.despachar_bomberos) tags += '<span style="background:rgba(245,158,11,0.2);color:#f59e0b;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:4px">🚒 Bomberos</span>';
+                    if (an.hay_heridos) tags += '<span style="background:rgba(239,68,68,0.2);color:#ef4444;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:4px">🩸 Heridos</span>';
+                    if (an.hay_armas) tags += '<span style="background:rgba(239,68,68,0.2);color:#ef4444;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:4px">🔫 Armas</span>';
+                    if (an.hay_fuego_humo) tags += '<span style="background:rgba(245,158,11,0.2);color:#f59e0b;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:4px">🔥 Fuego/Humo</span>';
+                    iaHtml += `
+                    <div style="margin-top:10px;padding:14px;background:var(--bg);border-radius:8px;border-left:3px solid ${urgColor}">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                            <strong style="font-size:13px">${(an.clasificacion||'').replace(/_/g,' ').toUpperCase()}</strong>
+                            <span style="background:${urgColor}22;color:${urgColor};padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600">${(an.urgencia||'').toUpperCase()}</span>
+                        </div>
+                        <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">${an.descripcion || ''}</p>
+                        ${an.accion_sugerida ? `<p style="font-size:12px;margin-bottom:8px"><strong>💡</strong> ${an.accion_sugerida}</p>` : ''}
+                        <div style="margin-bottom:6px">${tags}</div>
+                        <div style="font-size:11px;color:var(--text-dim)">📎 ${an.archivo_nombre||'—'} · 🎯 ${Math.round((an.confianza||0)*100)}% · 👥 ${an.personas_detectadas||0} personas · ${
+                            an.estado_revision === 'confirmado' ? '<span style="color:#22c55e">✅ Confirmado</span>' :
+                            an.estado_revision === 'corregido' ? '<span style="color:#f59e0b">✏️ Corregido</span>' :
+                            an.estado_revision === 'escalado' ? '<span style="color:#ef4444">⬆️ Escalado</span>' :
+                            an.estado_revision === 'descartado' ? '<span style="color:#94a3b8">🗑️ Descartado</span>' :
+                            '<span style="color:#f59e0b">⏳ Pendiente revisión</span>'
+                        }</div>
+                    </div>`;
+                });
             }
         } catch(e) {}
         
@@ -682,6 +733,7 @@ async function verDetalle(id) {
                 <a href="https://maps.google.com/?q=${a.latitud},${a.longitud}" target="_blank" style="color:var(--blue);margin-left:8px">Abrir en Maps</a>
             </div>` : ''}
             ${evidHtml}
+            ${iaHtml}
             <div style="margin-top:20px;display:flex;gap:8px">
                 ${a.atendida === 'no' ? `<button class="btn btn-green" onclick="atenderAlerta(${a.id});closeModal()">✓ Marcar atendida</button>` : ''}
                 <button class="btn btn-outline" onclick="closeModal()">Cerrar</button>
@@ -822,6 +874,149 @@ async function toggleUsuario(id) {
         await api(`/panel/usuarios/${id}/toggle`, { method: 'PUT' });
         loadUsuarios();
     } catch (e) { alert(e.message); }
+}
+
+// ======================== AUDITORIA ========================
+// ======================== REVISIÓN IA ========================
+async function loadRevisionIA() {
+    try {
+        const data = await api('/panel/revisiones-pendientes?limit=30');
+        const container = document.getElementById('revision-list');
+        
+        // Stats
+        try {
+            const stats = await api('/panel/analisis-stats');
+            const s = stats.stats;
+            document.getElementById('revision-stats').innerHTML = 
+                `Pendientes: <strong>${s.revision?.pendientes || 0}</strong> · Confirmados: <strong>${s.revision?.confirmados || 0}</strong> · Corregidos: <strong>${s.revision?.corregidos || 0}</strong>`;
+        } catch(e) {}
+        
+        if (!data.pendientes || !data.pendientes.length) {
+            container.innerHTML = '<div class="empty-state"><div class="icon">✅</div>No hay análisis pendientes de revisión</div>';
+            return;
+        }
+        
+        const urgColors = {critica:'#ef4444',alta:'#f59e0b',media:'#3b82f6',baja:'#22c55e',no_emergencia:'#94a3b8'};
+        
+        container.innerHTML = data.pendientes.map(r => {
+            const urgColor = urgColors[r.urgencia] || '#94a3b8';
+            let tags = '';
+            if (r.hay_heridos) tags += '<span style="background:rgba(239,68,68,0.15);color:#ef4444;padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px">🩸 Heridos</span>';
+            if (r.hay_armas) tags += '<span style="background:rgba(239,68,68,0.15);color:#ef4444;padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px">🔫 Armas</span>';
+            if (r.hay_fuego_humo) tags += '<span style="background:rgba(245,158,11,0.15);color:#f59e0b;padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px">🔥 Fuego</span>';
+            
+            let despachar = '';
+            if (r.despachar_ambulancia) despachar += '🚑 ';
+            if (r.despachar_policia) despachar += '🚔 ';
+            if (r.despachar_bomberos) despachar += '🚒 ';
+            
+            return `
+            <div style="padding:16px;background:var(--surface);border-radius:10px;margin-bottom:12px;border-left:4px solid ${urgColor}">
+                <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
+                    <div>
+                        <strong style="font-size:15px">${(r.clasificacion||'').replace(/_/g,' ').toUpperCase()}</strong>
+                        <span style="background:${urgColor}22;color:${urgColor};padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600;margin-left:8px">${(r.urgencia||'').toUpperCase()}</span>
+                        <span style="font-size:11px;color:var(--text-dim);margin-left:8px">🎯 ${Math.round((r.confianza||0)*100)}%</span>
+                    </div>
+                    <span style="font-size:12px;color:var(--text-dim)">Alerta #${r.alerta_id}</span>
+                </div>
+                <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">${r.descripcion || ''}</p>
+                ${r.accion_sugerida ? `<p style="font-size:12px;margin-bottom:8px"><strong>💡 IA sugiere:</strong> ${r.accion_sugerida}</p>` : ''}
+                <div style="margin-bottom:8px">${tags} ${despachar ? `<span style="font-size:12px">Despachar: ${despachar}</span>` : ''}</div>
+                <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+                    👤 ${r.nombre || 'Anónimo'} · 📎 ${r.archivo_nombre || '—'} · 👥 ${r.personas_detectadas||0} personas
+                    ${r.latitud ? ` · <a href="https://maps.google.com/?q=${r.latitud},${r.longitud}" target="_blank" style="color:var(--blue)">📍 Mapa</a>` : ''}
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="btn btn-green" onclick="revisarAnalisis(${r.id},'confirmar')" style="font-size:12px;padding:6px 14px">✅ Confirmar</button>
+                    <button class="btn btn-outline" onclick="abrirCorreccion(${r.id},'${(r.clasificacion||'').replace(/'/g,'')}','${r.urgencia||''}')" style="font-size:12px;padding:6px 14px">✏️ Corregir</button>
+                    <button class="btn" onclick="revisarAnalisis(${r.id},'escalar')" style="font-size:12px;padding:6px 14px;background:#f59e0b;color:#000">⬆️ Escalar</button>
+                    <button class="btn btn-outline" onclick="revisarAnalisis(${r.id},'descartar')" style="font-size:12px;padding:6px 14px;color:#ef4444;border-color:#ef4444">🗑️ Descartar</button>
+                </div>
+            </div>`;
+        }).join('');
+    } catch(e) {
+        document.getElementById('revision-list').innerHTML = `<div class="empty-state"><div class="icon">⚠️</div>${e.message}</div>`;
+    }
+}
+
+async function revisarAnalisis(analisisId, accion) {
+    const notas = accion === 'descartar' ? prompt('Motivo del descarte (opcional):') : null;
+    try {
+        const resp = await api(`/panel/analisis/${analisisId}/revisar`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ accion, notas })
+        });
+        alert(`✅ Análisis ${accion} exitosamente`);
+        loadRevisionIA();
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+function abrirCorreccion(analisisId, clasifActual, urgActual) {
+    const clasificaciones = ['accidente_transito','robo_hurto','agresion_fisica','incendio','inundacion',
+        'dano_propiedad','persona_herida','persona_sospechosa','vehiculo_sospechoso','situacion_riesgo',
+        'caida_persona','emergencia_medica','no_emergencia'];
+    const urgencias = ['critica','alta','media','baja','no_emergencia'];
+    
+    showModal(`
+        <h2>✏️ Corregir análisis #${analisisId}</h2>
+        <div style="display:grid;gap:12px;margin-top:16px">
+            <div>
+                <label style="font-size:13px;font-weight:600;display:block;margin-bottom:4px">Clasificación correcta:</label>
+                <select id="corr-clasif" style="width:100%;padding:8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px">
+                    ${clasificaciones.map(c => `<option value="${c}" ${c===clasifActual?'selected':''}>${c.replace(/_/g,' ')}</option>`).join('')}
+                </select>
+            </div>
+            <div>
+                <label style="font-size:13px;font-weight:600;display:block;margin-bottom:4px">Urgencia real:</label>
+                <select id="corr-urgencia" style="width:100%;padding:8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px">
+                    ${urgencias.map(u => `<option value="${u}" ${u===urgActual?'selected':''}>${u}</option>`).join('')}
+                </select>
+            </div>
+            <div>
+                <label style="font-size:13px;font-weight:600;display:block;margin-bottom:4px">Acción correcta:</label>
+                <input id="corr-accion" type="text" placeholder="Ej: Enviar patrulla de tránsito, no requiere ambulancia" 
+                    style="width:100%;padding:8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;box-sizing:border-box">
+            </div>
+            <div style="display:flex;gap:12px">
+                <label style="font-size:12px"><input type="checkbox" id="corr-ambulancia"> 🚑 Ambulancia</label>
+                <label style="font-size:12px"><input type="checkbox" id="corr-policia"> 🚔 Policía</label>
+                <label style="font-size:12px"><input type="checkbox" id="corr-bomberos"> 🚒 Bomberos</label>
+            </div>
+            <div>
+                <label style="font-size:13px;font-weight:600;display:block;margin-bottom:4px">Notas:</label>
+                <textarea id="corr-notas" rows="2" placeholder="Observaciones del revisor..."
+                    style="width:100%;padding:8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;box-sizing:border-box;resize:vertical"></textarea>
+            </div>
+        </div>
+        <div style="margin-top:16px;display:flex;gap:8px">
+            <button class="btn btn-green" onclick="enviarCorreccion(${analisisId})">💾 Guardar corrección</button>
+            <button class="btn btn-outline" onclick="closeModal()">Cancelar</button>
+        </div>
+    `);
+}
+
+async function enviarCorreccion(analisisId) {
+    try {
+        await api(`/panel/analisis/${analisisId}/revisar`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                accion: 'corregir',
+                clasificacion: document.getElementById('corr-clasif').value,
+                urgencia: document.getElementById('corr-urgencia').value,
+                accion_sugerida: document.getElementById('corr-accion').value || null,
+                despachar_ambulancia: document.getElementById('corr-ambulancia').checked,
+                despachar_policia: document.getElementById('corr-policia').checked,
+                despachar_bomberos: document.getElementById('corr-bomberos').checked,
+                notas: document.getElementById('corr-notas').value || null,
+            })
+        });
+        closeModal();
+        alert('✅ Corrección guardada');
+        loadRevisionIA();
+    } catch(e) { alert('Error: ' + e.message); }
 }
 
 // ======================== AUDITORIA ========================
