@@ -31,6 +31,11 @@ import math
 import httpx
 import logging
 import time
+os.environ['TZ'] = 'America/Bogota'
+try:
+    time.tzset()
+except AttributeError:
+    pass  # Windows no tiene tzset
 import asyncpg
 import re
 import base64
@@ -267,11 +272,14 @@ def generar_mensajes_protocolo(protocolo: dict, nombre: str, ubicacion: str, dis
 
 # ==================== POSTGRESQL ====================
 
+async def _init_connection(conn):
+    await conn.execute("SET timezone = 'America/Bogota'")
+
 async def get_pool():
     if not hasattr(app.state, 'pool') or app.state.pool is None:
         database_url = os.getenv('DATABASE_URL') or os.getenv('INTERNAL_DATABASE_URL')
         if database_url:
-            app.state.pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
+            app.state.pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10, init=_init_connection)
         else:
             app.state.pool = await asyncpg.create_pool(
                 host=os.getenv('DB_HOST', 'localhost'),
@@ -280,6 +288,7 @@ async def get_pool():
                 password=os.getenv('DB_PASSWORD'),
                 database=os.getenv('DB_NAME'),
                 min_size=2, max_size=10,
+                init=_init_connection,
             )
     return app.state.pool
 
@@ -299,7 +308,8 @@ async def startup():
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        log.info("✅ Conectado a PostgreSQL")
+            await conn.execute("SET timezone = 'America/Bogota'")
+        log.info("✅ Conectado a PostgreSQL (zona horaria: Colombia)")
         await migrar_tablas_panel()
     except Exception as e:
         log.error(f"❌ Error conectando a PostgreSQL: {e}")
