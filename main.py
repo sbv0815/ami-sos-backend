@@ -41,6 +41,7 @@ import re
 import base64
 import secrets
 import bcrypt
+from ia_provider import ia_completion
 
 # ==================== APP ====================
 
@@ -1094,16 +1095,16 @@ async def test_ble_endpoint(req: AlertaBLE):
         "timestamp": datetime.now().isoformat(),
     }
 
-# ==================== CLASIFICAR CON CLAUDE ====================
+
+# ==================== CLASIFICAR CON IA MULTI-PROVEEDOR ====================
 
 @app.post("/alerta/clasificar")
 async def clasificar_emergencia(req: ClasificarRequest):
-    api_key = os.getenv('ANTHROPIC_API_KEY')
-    if not api_key:
-        raise HTTPException(500, "API key Anthropic no configurada")
+    # 1. Validación inicial
     if not req.texto:
         raise HTTPException(400, "Se requiere texto")
     
+    # 2. Definir el prompt para la IA
     prompt = f"""Clasifica esta emergencia reportada en Colombia.
 CONTEXTO: {req.contexto_usuario or 'No disponible'}
 REPORTE: "{req.texto}"
@@ -1113,17 +1114,41 @@ Responde SOLO en JSON:
 
 Niveles: 1=leve(cuidadores), 2=grave(+institucionales), 3=crítica(+red comunitaria)"""
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post("https://api.anthropic.com/v1/messages",
-            json={'model': 'claude-sonnet-4-5-20250929', 'max_tokens': 500, 'messages': [{'role': 'user', 'content': prompt}]},
-            headers={'Content-Type':'application/json','x-api-key':api_key,'anthropic-version':'2023-06-01'}, timeout=30)
-        if resp.status_code != 200:
-            raise HTTPException(502, f"Error Claude: {resp.status_code}")
-        text = resp.json()['content'][0]['text']
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            return {'success': True, 'clasificacion': json.loads(match.group())}
-        raise HTTPException(500, "Error parseando respuesta IA")
+    # 3. Obtener el pool de base de datos para registrar el consumo de tokens
+    pool = await get_pool()
+
+    # 4. LLAMAR A LA IA (Intentará Anthropic -> Gemini -> OpenAI automáticamente)
+    ia_result = await ia_completion(
+        system_prompt=prompt, 
+        messages=[{'role': 'user', 'content': req.texto}], 
+        options={'tier': 'sonnet', 'max_tokens': 500},
+        pool=pool, 
+        user_id=req.id_persona,
+        tipo_operacion='clasificacion_sos'
+    )
+
+    # 5. Si todos los proveedores fallaron
+    if not ia_result['success']:
+        log.error(f"❌ Error crítico: Todos los proveedores de IA fallaron: {ia_result.get('error')}")
+        raise HTTPException(502, f"Error en servicios de IA: {ia_result.get('error')}")
+
+    # 6. Procesar la respuesta exitosa
+    text = ia_result['text']
+    
+    # Extraer el JSON de la respuesta (por si la IA agrega texto extra)
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        try:
+            return {
+                'success': True, 
+                'clasificacion': json.loads(match.group()),
+                'provider': ia_result.get('provider'), # Opcional: para saber quién respondió
+                'fallback': ia_result.get('fallback', False)
+            }
+        except json.JSONDecodeError:
+            raise HTTPException(500, "La IA respondió un JSON inválido")
+            
+    raise HTTPException(500, "No se encontró un formato JSON válido en la respuesta de la IA")
 
 # ==================== LOGIN / REGISTRO / CONSULTAS ====================
 

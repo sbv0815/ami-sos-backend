@@ -7,3 +7,4 @@ cryptography
 pydantic
 bcrypt
 google-cloud-storage
+python-dotenv
