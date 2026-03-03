@@ -485,6 +485,37 @@ def row_to_dict(record):
         return None
     return {k: serializar(v) for k, v in dict(record).items()}
 
+# ==================== ANTI-SPAM: ALERTAS DUPLICADAS ====================
+
+ANTI_SPAM_SEGUNDOS = 60  # Ventana anti-duplicados
+
+async def _verificar_alerta_reciente(pool, cel_con: str) -> dict:
+    """
+    Verifica si ya existe una alerta del mismo celular en los últimos N segundos.
+    Retorna {'duplicada': True, 'alerta_id': X, ...} si es duplicada.
+    Retorna {'duplicada': False} si se puede crear nueva.
+    """
+    async with pool.acquire() as conn:
+        reciente = await conn.fetchrow("""
+            SELECT id, nivel_emergencia, tipo_alerta, fecha_hora
+            FROM alertas_panico
+            WHERE celular = $1
+              AND fecha_hora > NOW() - INTERVAL '%s seconds'
+            ORDER BY fecha_hora DESC LIMIT 1
+        """ % ANTI_SPAM_SEGUNDOS, cel_con)
+    
+    if reciente:
+        segundos = ANTI_SPAM_SEGUNDOS
+        log.info(f"  ⏸ ANTI-SPAM: Alerta reciente #{reciente['id']} (hace <{segundos}s) — ignorando duplicada")
+        return {
+            'duplicada': True,
+            'alerta_id': reciente['id'],
+            'nivel_emergencia': reciente['nivel_emergencia'],
+            'tipo_alerta': reciente['tipo_alerta'],
+            'fecha': reciente['fecha_hora'].isoformat() if reciente['fecha_hora'] else None,
+        }
+    return {'duplicada': False}
+
 # ==================== FIREBASE ====================
 
 async def obtener_access_token_firebase():
@@ -599,6 +630,21 @@ async def recibir_alerta(req: AlertaRequest, bg: BackgroundTasks):
     nivel = req.nivel_emergencia
     if nivel not in (1, 2, 3):
         nivel = 2
+    
+    # ANTI-SPAM: Verificar si ya hay alerta reciente de este celular
+    spam_check = await _verificar_alerta_reciente(pool, cel_con)
+    if spam_check['duplicada']:
+        return {
+            'success': True,
+            'alerta_id': spam_check['alerta_id'],
+            'nivel_emergencia': spam_check['nivel_emergencia'],
+            'mensaje': f'Alerta #{spam_check["alerta_id"]} ya activa (anti-spam {ANTI_SPAM_SEGUNDOS}s)',
+            'duplicada': True,
+            'notificados': {'cuidadores': 0, 'institucionales': 0, 'red_comunitaria': 0, 'total': 0},
+            'institucionales_detalle': [],
+            'comunidad_cercanos': 0,
+            'tiempo_ms': 0,
+        }
     
     etiquetas = {1: "🟡 LEVE", 2: "🟠 GRAVE", 3: "🔴 CRÍTICA"}
     log.info(f"🚨 ALERTA NIVEL {nivel} {etiquetas[nivel]}: tipo={req.tipo_alerta} fuente={req.fuente_alerta} cel={cel_con}")
@@ -1002,6 +1048,22 @@ async def alerta_ble_unificada(req: AlertaBLE, bg: BackgroundTasks):
     
     log.info(f"🔵 BLE ALERTA [{plataforma.upper()}]: cel={cel_con} nivel={req.nivel_emergencia} mac={req.mac_dispositivo or 'N/A'}")
     
+    # ANTI-SPAM: Verificar si ya hay alerta reciente de este celular
+    pool = await get_pool()  # ← ESTA LÍNEA ES LA QUE FALTA
+    spam_check = await _verificar_alerta_reciente(pool, cel_con)
+    if spam_check['duplicada']:
+        log.info(f"  ⏸ BLE duplicada — retornando alerta #{spam_check['alerta_id']}")
+        return {
+            'success': True,
+            'alerta_id': spam_check['alerta_id'],
+            'nivel_emergencia': spam_check['nivel_emergencia'],
+            'plataforma': plataforma,
+            'fuente': 'boton_ble',
+            'mensaje': f'Alerta #{spam_check["alerta_id"]} ya activa (anti-spam {ANTI_SPAM_SEGUNDOS}s)',
+            'duplicada': True,
+            'notificados': {'total': 0},
+            'tiempo_total_ms': round((time.time() - inicio) * 1000),
+        }
     if plataforma == "ami_sos":
         log.info(f"  → Procesando en Ami SOS (interno)")
         alerta_req = AlertaRequest(
